@@ -29,13 +29,14 @@ npx serve .
 # â†’ open the URL it prints (http://localhost:3000 by default)
 ```
 
-Then click **START GAME** and **allow camera access** when prompted.
+Then open the menu and pick **PLAY (2 PLAYERS)** (or **SOLO VS AI**) and
+**allow camera access** when prompted.
 
 - **Desktop Chrome** is the recommended browser (also works in Edge and Firefox).
 - **Mobile Chrome / Safari** work if the page is served over **HTTPS**
   (e.g. via `npx serve` behind a tunnel, or any static host like GitHub
-  Pages / Netlify). Plain `http://<lan-ip>` will not get camera permission
-  on phones.
+  Pages / Netlify / Vercel). Plain `http://<lan-ip>` will not get camera
+  permission on phones.
 - If the CDN scripts load slowly the first time, wait a few seconds â€” the
   hand-tracking model files are downloaded once and then cached.
 
@@ -126,7 +127,7 @@ Every gameplay constant lives in this one frozen object. Most useful knobs:
 | `PUCK_STUCK_TIME` / `PUCK_NUDGE_SPEED` | 1.6 s / 260 | Anti-stuck: how long a slow puck is tolerated before the nudge, and how hard it's nudged. |
 | `DEFAULT_SMOOTHING` | 0.5 | Same as the settings slider. |
 | `MISSING_HAND_TIMEOUT` | 3000 | ms of lost hands before auto-pause. |
-| `CAM_BG_OPACITY` | 0.35 | Visibility of the camera feed behind the table. |
+| `CAM_BG_OPACITY` | 0.15 | Visibility of the camera feed behind the table (AR look). |
 | `CAMERA_WIDTH/HEIGHT` | 1280Ã—720 | Requested camera resolution. |
 
 `SCORE_RESET_DELAY`, `TRACK_*`, `HINT_SHOW_DELAY`, `CORNER_RADIUS` and the
@@ -161,5 +162,51 @@ js/game.js          state machine, HUD, scoring, settings
 Runs entirely client-side; the only network use is the MediaPipe CDN
 (model + WASM) which is cached by the browser after the first load.
 
-*Have fun â€” and remember: the mallet is your hand.*
+## 8. Deployment (Vercel)
 
+This is a fully static site — plain HTML/CSS/JS with **no build step, no
+package manager and no bundler**. The whole repository root *is* the
+production output. A `vercel.json` already ships with clean URLs and
+caching headers (entry `index.html` revalidates on every load; `js/*` and
+`style.css` cache for 1 h).
+
+1. **Push to GitHub**
+
+   ```bash
+   git init
+   git add .
+   git commit -m "HOCKEY-AR"
+   git remote add origin https://github.com/<you>/ar-hockey.git
+   git push -u origin main
+   ```
+
+   (Or keep the push flow you already use — just make sure `vercel.json`,
+   `index.html`, `style.css` and `js/` sit in the repository root.)
+
+2. **Link the repo to Vercel**
+   - Go to [vercel.com/new](https://vercel.com/new) and *Import* your
+     `ar-hockey` repository.
+   - Leave everything at the defaults:
+     - **Framework Preset:** Other (auto-detected static)
+     - **Build Command:** — (empty)
+     - **Output Directory:** — (empty; the repo root is served)
+     - **Install Command:** — (empty; there are no dependencies)
+   - Click *Deploy* — your live URL (e.g. `ar-hockey.vercel.app`) appears
+     in seconds.
+
+3. **Continuous deployments** come free of charge: every push to `main`
+   redeploys production automatically, and every pull request gets its own
+   preview URL.
+
+4. **Camera access** works right away — Vercel serves over HTTPS, which is
+   exactly what `getUserMedia` requires. Remind players that the game only
+   downloads the MediaPipe model from a CDN; nothing from their webcam
+   ever leaves the browser.
+
+### Other static hosts
+
+Because there is no build pipeline, the site works identically on GitHub
+Pages, Netlify or any static file server — serve the repository root
+as-is.
+
+*Have fun — and remember: the mallet is your hand.*
