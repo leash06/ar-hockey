@@ -22,6 +22,7 @@ class SoundManager {
     this.master = null;       // master gain node (global volume)
     this.enabled = true;      // settings toggle (sound effects on/off)
     this._noiseBuffer = null; // cached white-noise buffer for thuds/clanks
+    this._alarmAt = -999;     // last alarm start time (audio-context clock)
   }
 
   /* ------------------------------------------------------------------
@@ -204,6 +205,71 @@ class SoundManager {
 
       osc.connect(g).connect(this.master);
       osc.start(t); osc.stop(t + 0.06);
+    });
+  }
+
+  /**
+   * Menu hover whoosh — soft filtered noise sweep when the hand cursor
+   * highlights a different button. Throttled (~120 ms) so rapid cursor
+   * movement can't machine-gun the sound.
+   */
+  hover() {
+    this._fx(() => {
+      const now = this.ctx.currentTime;
+
+      // throttle: skip if the previous whoosh is younger than 120 ms
+      if (now - (this._hoverAt || -999) < 0.12) return;
+      this._hoverAt = now;
+
+      const t = this.ctx.currentTime;
+      const noise = this._noise();
+
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'bandpass';
+      f.Q.value = 1.4;
+      f.frequency.setValueAtTime(500, t);
+      f.frequency.exponentialRampToValueAtTime(2600, t + 0.1);
+
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(0.05, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+
+      noise.connect(f).connect(g).connect(this.master);
+      noise.start(t); noise.stop(t + 0.14);
+    });
+  }
+
+  /**
+   * Out-of-bounds / accuracy alarm — short, high-frequency pulsing beeps
+   * ("tit-tit-tit") built from a rapid oscillator + gain pulse loop.
+   * Throttled: safe to call every animation frame from the game loop; only
+   * one burst per CONFIG.OUT_OF_BOUNDS_ALARM_INTERVAL seconds is scheduled.
+   */
+  outOfBoundsAlarm() {
+    this._fx(() => {
+      const now = this.ctx.currentTime;
+
+      // throttle — skip if the previous burst is still within its window
+      if (now - this._alarmAt < CONFIG.OUT_OF_BOUNDS_ALARM_INTERVAL) return;
+      this._alarmAt = now;
+
+      for (let i = 0; i < 3; i++) {
+        const t = now + i * 0.085;  // tit-tit-tit rhythm
+
+        const osc = this.ctx.createOscillator();
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(2200 + i * 160, t); // rising, urgent
+
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.linearRampToValueAtTime(0.11, t + 0.006);  // sharp attack
+        g.gain.setValueAtTime(0.11, t + 0.028);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05); // quick decay
+
+        osc.connect(g).connect(this.master);
+        osc.start(t); osc.stop(t + 0.06);
+      }
     });
   }
 

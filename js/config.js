@@ -65,13 +65,38 @@ const CONFIG = {
   USE_PALM_CENTER: true,
   FINGERTIP_LANDMARK: 8,      // index fingertip, used when USE_PALM_CENTER = false
 
-  // Smoothing: exponential lerp factor derived from smoothing setting.
-  // Raw factor = 1 - SMOOTHING_STRENGTH, then squared so 0.5 feels responsive
-  // (higher smoothing strength => lower lerp factor => steadier, twitchier-free).
-  DEFAULT_SMOOTHING: 0.5,     // settings range 0..1 (0 = raw, 1 = very smooth)
+  // Smoothing: the slider (0..1) maps onto a One Euro Filter
+  // (velocity-adaptive low-latency filter), not a static lerp:
+  //   0 = raw feel (high cutoff), 1 = very smooth/steady (low cutoff).
+  DEFAULT_SMOOTHING: 0.5,     // settings range 0..1
 
-  MISSING_HAND_TIMEOUT: 3000, // ms without hands -> auto-pause game
+  // ---- One Euro Filter tuning ------------------------------------------
+  FILTER_MIN_CUTOFF_MIN: 0.6, // Hz cutoff at smoothing = 1 (max smoothing)
+  FILTER_MIN_CUTOFF_MAX: 3.0, // Hz cutoff at smoothing = 0 (max responsiveness)
+  FILTER_BETA: 4.0,           // speed coefficient: adaptive cutoff rise
+  FILTER_DC_CUTOFF: 1.2,      // Hz for the velocity low-pass
+  FILTER_JUMP_RESET_DIST: 0.30, // normalized jump distance that resets the filter
+
+  // ---- Boundary / depth accuracy warnings ------------------------------
+  // Margin tuned low so only serious frame-edge cutoffs trigger the
+  // out-of-bounds alarm (hands near the edge are normal during play).
+  HAND_OUT_OF_BOUNDS_MARGIN: 0.05, // normalized video-edge margin -> OOB warning
+  // Lower bound raised less aggressively: hand size varies across cameras
+  // and couch distances - a too-eager minimum caused constant false
+  // "too far" alarms for perfectly visible hands.
+  HAND_MIN_PALM_SIZE: 0.045,  // landmark bbox span below this = hand too far away
+  HAND_MAX_PALM_SIZE: 0.55,   // landmark bbox span above this = hand too close
+  OUT_OF_BOUNDS_ALARM_INTERVAL: 0.45, // s between alarm beeps (audio throttle)
+
+  MISSING_HAND_TIMEOUT: 3000, // ms without hands -> auto-pause
   HINT_SHOW_DELAY: 450,       // ms without a hand -> show "Show your hand" hint
+
+  /* ======================================================================
+   * PERFORMANCE / THROTTLING
+   * ====================================================================== */
+  RENDER_MAX_DPR: 2,        // cap devicePixelRatio on the game canvas (retina cost)
+  UI_UPDATE_MS: 100,        // DOM hint/warning refresh budget (~10 Hz)
+  ALARM_PULSE_MS: 520,      // pacing of continuous lost/OOB alarm bursts
 
   /* ======================================================================
    * CAMERA / DISPLAY
@@ -80,7 +105,7 @@ const CONFIG = {
   CAMERA_HEIGHT: 720,         // requested camera stream height
   CAMERA_FPS: 30,
 
-  CAM_BG_OPACITY: 0.35,       // opacity of the mirrored camera feed behind table
+  CAM_BG_OPACITY: 0.15,       // opacity of the mirrored camera feed behind table (AR effect stays readable)
 
   DEFAULT_ORIENTATION: 'lr',  // 'lr' = players left/right, 'tb' = players top/bottom
   DEFAULT_SHOW_CAM_BG: true,  // show camera feed behind the table
@@ -98,4 +123,26 @@ Object.freeze(CONFIG);
 /* Make it globally accessible (also when bundled later). */
 if (typeof window !== 'undefined') {
   window.CONFIG = CONFIG;
+}
+
+/**
+ * THEME — visual identity for the HOCKEY-AR redesign (all colors in one place).
+ * Frozen for the same reason as CONFIG.
+ */
+const THEME = Object.freeze({
+  P_COLORS: ['#39ff88', '#ff3b44'],          // P1 green (half 1), P2 red (half 2)
+  PUCK: '#ffffff',                            // puck is white
+  // Border quadrant colors {TL, TR, BL, BR} — yellow / green / red / blue.
+  BORDER_SEGMENTS: ['#ffcf3f', '#39ff88', '#ff3b44', '#2b6bff'],
+  BORDER_WIDTH: 8,                            // px stroke width of the neon border
+  BLOOM_BLUR: 6,                              // soft bloom blur radius for thin strokes
+  TRAIL_RGB: '230, 245, 255',                 // puck trail color (rgb triple, drawn at low alpha)
+  WARN_RED_RGB: '255, 59, 68',                // out-of-bounds alarm (max stroke color)
+  WARN_AMBER_RGB: '255, 157, 63',             // depth/lost warning color
+  CENTER_RGB: '120, 140, 150',                // center line / circle markings (dim)
+  CYAN: '#00e5ff',                            // accent for cursor dwell bars / hover
+});
+
+if (typeof window !== 'undefined') {
+  window.THEME = THEME;
 }

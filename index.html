@@ -3,8 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="theme-color" content="#06060f">
-  <title>Neon Air Hockey — Webcam Battle</title>
+  <meta name="theme-color" content="#000000">
+  <title>HOCKEY-AR — Webcam Hand-Tracking Battle</title>
+
+  <!-- Fonts: Orbitron (titles) + Rajdhani (UI) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
 
   <!-- MediaPipe Hands (JavaScript, via CDN) -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
@@ -16,120 +21,208 @@
 
   <!-- ============================================================
        Hidden <video> element that receives the webcam stream.
-       The frame is shown via canvas rendering (mirrored), never directly.
+       All drawing happens on canvases (mirrored), never directly.
        ============================================================ -->
   <video id="cameraFeed" playsinline autoplay muted style="display: none;"></video>
 
-  <!-- ============================================================
-       Main game container — centers the canvas in the viewport
-       and maintains the table's aspect ratio.
-       ============================================================ -->
   <main id="gameContainer">
 
-    <!-- Game surface: camera frame + table + puck + paddles are drawn here -->
+    <!-- Game surface: camera frame + table + puck + paddles -->
     <canvas id="gameCanvas" width="1280" height="720"></canvas>
 
     <!-- ============================================================
-         GAME HUD (visible during play)
+         GAME HUD — compact centered score pill:  1  [II]  0
          ============================================================ -->
     <section id="gameHud" class="overlay hud-overlay hidden">
-      <!-- Player 1 scoreboard -->
-      <div id="p1ScorePanel" class="score-panel score-panel--p1">
-        <span class="score-label">P1</span>
-        <span id="p1Score" class="score-value">0</span>
+      <div class="score-pill">
+        <span id="p1Score" class="score-num score-num--p1">0</span>
+        <span class="score-sep"></span>
+        <button id="pauseBtn" class="pause-btn" type="button" title="Pause">&#10074;&#10074;</button>
+        <span class="score-sep"></span>
+        <span id="p2Score" class="score-num score-num--p2">0</span>
       </div>
-
-      <!-- Player 2 scoreboard -->
-      <div id="p2ScorePanel" class="score-panel score-panel--p2">
-        <span class="score-label">P2</span>
-        <span id="p2Score" class="score-value">0</span>
-      </div>
-
-      <!-- Pause / settings button -->
-      <button id="pauseBtn" class="icon-btn" type="button" title="Pause / Settings">II</button>
 
       <!-- FPS counter (debug mode only) -->
       <div id="fpsDisplay" class="fps-display hidden">FPS: --</div>
     </section>
 
     <!-- ============================================================
-         FLOATING HAND HINTS — shown per side when the player's
-         hand is not detected ("Show your hand").
+         FLOATING HAND HINTS — per side when a hand is missing
+         ("SHOW YOUR HAND")
          ============================================================ -->
     <div id="handHintP1" class="hand-hint hand-hint--p1 hidden">
       <div class="hand-hint-icon">&#x270B;</div>
-      <div class="hand-hint-text">Player 1<br>Show your hand</div>
+      <div class="hand-hint-text">P1 &mdash; SHOW<br>YOUR HAND</div>
     </div>
 
     <div id="handHintP2" class="hand-hint hand-hint--p2 hidden">
       <div class="hand-hint-icon">&#x270B;</div>
-      <div class="hand-hint-text">Player 2<br>Show your hand</div>
+      <div class="hand-hint-text">P2 &mdash; SHOW<br>YOUR HAND</div>
     </div>
 
     <!-- ============================================================
-         START SCREEN
+         HUD ACCURACY WARNINGS — the yellow-bar system
          ============================================================ -->
-    <section id="startScreen" class="overlay screen-overlay">
-      <h1 class="game-title">
-        <span class="game-title-line game-title-line--1">NEON</span>
-        <span class="game-title-line game-title-line--2">AIR HOCKEY</span>
-      </h1>
+    <div id="handWarningP1" class="hand-warning hand-warning--p1 hidden">
+      <span class="warn-bar"></span>
+      <span id="handWarningTextP1" class="warn-text">HAND OUT OF BOUNDS</span>
+    </div>
 
-      <p class="subtitle">Hands on the table &mdash; webcam battle, first to <strong>7</strong></p>
+    <div id="handWarningP2" class="hand-warning hand-warning--p2 hidden">
+      <span class="warn-bar"></span>
+      <span id="handWarningTextP2" class="warn-text">HAND OUT OF BOUNDS</span>
+    </div>
 
-      <button id="startBtn" class="neon-btn neon-btn--primary" type="button">START GAME</button>
-
-      <p id="cameraNotice" class="notice">
-        This game uses your webcam for hand tracking.<br>
-        Your browser will ask for camera permission &mdash; nothing is uploaded,
-        all processing happens locally.
-      </p>
-    </section>
+    <!-- GOAL splash overlay (large pop-up text on a goal, ~0.9s) -->
+    <div id="goalSplash" class="goal-splash hidden"><span class="goal-splash-text">GOAL!</span></div>
 
     <!-- ============================================================
-         CALIBRATION SCREEN — wait until both hands are detected
+         MAIN MENU — HOCKEY-AR (id kept as "startScreen").
+         Buttons are driven by: hand cursor (dwell / pinch) or mouse.
          ============================================================ -->
-    <section id="calibrationScreen" class="overlay screen-overlay hidden">
-      <h2 class="screen-title">CALIBRATION</h2>
+    <section id="startScreen" class="overlay screen screen--menu hidden">
+      <header class="menu-top">
+        <span class="menu-kicker">MAIN MENU</span>
+        <div class="menu-logo">HOCKEY<span class="logo-ar">AR</span></div>
+      </header>
 
-      <p class="screen-subtitle">Both players, show your hand to the camera</p>
+      <nav class="menu-stack">
+        <button id="menuPlay2p" class="hx-btn" type="button">
+          <span class="hx-label">PLAY (2 PLAYERS)</span>
+          <span class="dwell"><i></i></span>
+        </button>
+        <button id="menuSolo" class="hx-btn" type="button">
+          <span class="hx-label">SOLO VS AI</span>
+          <span class="dwell"><i></i></span>
+        </button>
+        <button id="menuHowTo" class="hx-btn" type="button">
+          <span class="hx-label">HOW TO PLAY</span>
+          <span class="dwell"><i></i></span>
+        </button>
+        <button id="menuSettings" class="hx-btn" type="button">
+          <span class="hx-label">SETTINGS</span>
+          <span class="dwell"><i></i></span>
+        </button>
+      </nav>
 
-      <div class="calibration-status">
-        <div id="calibP1" class="calib-chip calib-chip--p1" data-state="missing">
-          <span class="calib-dot"></span>
-          <span class="calib-label">Player 1 Hand</span>
-        </div>
-
-        <div id="calibP2" class="calib-chip calib-chip--p2" data-state="missing">
-          <span class="calib-dot"></span>
-          <span class="calib-label">Player 2 Hand</span>
-        </div>
+      <!-- Right visual column: attract-mode canvas behind camera preview -->
+      <div class="menu-visual">
+        <canvas id="attractCanvas"></canvas>
+        <canvas id="camPreview"></canvas>
+        <span class="visual-corner visual-corner--tl"></span>
+        <span class="visual-corner visual-corner--tr"></span>
+        <span class="visual-corner visual-corner--bl"></span>
+        <span class="visual-corner visual-corner--br"></span>
+        <span class="visual-tag">CAM 01 &mdash; LIVE</span>
       </div>
 
-      <p id="calibPrompt" class="calib-prompt">Waiting for hands&hellip;</p>
+      <!-- Bottom row: player card (left), status (center), back (right) -->
+      <div class="menu-footer">
+        <!-- Placeholder user card -->
+        <div class="player-card" id="playerCard">
+          <div class="pc-icon">&#x270B;</div>
+          <div class="pc-meta">
+            <div class="pc-name">PLAYER 1</div>
+            <div class="pc-line">Matches: 0</div>
+            <div class="pc-line">Level 1</div>
+          </div>
+        </div>
+
+        <!-- Status line: hand detection + lighting -->
+        <div class="menu-status">
+          <span class="dot" id="statusHandDot"></span>
+          <span id="statusHandText">NO HAND</span>
+          <span class="dot dot-spacer" id="statusLightDot"></span>
+          <span id="statusLightText">LIGHT: --</span>
+        </div>
+
+        <!-- Rounded back icon (inset from the corner) -->
+        <button id="menuBackBtn" class="hx-btn hx-btn--icon back-btn" type="button" title="Back">
+          <span class="hx-label">&#8592;</span>
+          <span class="dwell"><i></i></span>
+        </button>
+      </div>
+
+      <!-- Hand-controlled menu cursor -->
+      <div id="menuCursor" class="menu-cursor hidden"></div>
     </section>
 
     <!-- ============================================================
-         GAME OVER SCREEN
+         HOW TO PLAY screen
          ============================================================ -->
-    <section id="gameOverScreen" class="overlay screen-overlay hidden">
-      <h2 id="winnerMessage" class="screen-title winner-title">
-        PLAYER 1 WINS!
-      </h2>
+    <section id="howToScreen" class="overlay screen hidden">
+      <h2 class="screen-title">HOW TO PLAY</h2>
 
-      <p id="finalScoreLine" class="final-score">7 &mdash; 0</p>
+      <ul class="howto-list">
+        <li><b>MOVE</b> &mdash; your hand is your paddle, mirrored like a real table.</li>
+        <li><b>MENU</b> &mdash; point with your index finger; hold on a button for 1s or pinch (index + thumb) to select.</li>
+        <li><b>CALIBRATION</b> &mdash; each player holds a hand over their own half until the check marks turn on.</li>
+        <li><b>STAY IN FRAME</b> &mdash; keep the whole hand away from the edges and at a comfortable distance from the camera for the best accuracy.</li>
+        <li><b>SCORE</b> &mdash; first to 7 goals wins the match.</li>
+      </ul>
 
-      <button id="playAgainBtn" class="neon-btn neon-btn--primary" type="button">PLAY AGAIN</button>
-      <button id="backToMenuBtn" class="neon-btn neon-btn--ghost" type="button">MAIN MENU</button>
+      <button id="howToBackBtn" class="hx-btn" type="button">
+        <span class="hx-label">&#8592; BACK</span>
+        <span class="dwell"><i></i></span>
+      </button>
     </section>
 
     <!-- ============================================================
-         PAUSE SCREEN (shown when auto-paused or user pauses)
+         CALIBRATION — halves split left/right, check chips confirm
+         detection while the prompt counts down 3 - 2 - 1
          ============================================================ -->
-    <section id="pauseScreen" class="overlay screen-overlay hidden">
+    <section id="calibrationScreen" class="overlay screen screen--calib hidden">
+      <div class="calib-half calib-half--p1">
+        <div class="calib-side-name">PLAYER 1</div>
+        <div id="calibP1" class="calib-check" data-state="missing">&#10003;</div>
+        <div class="calib-side-sub">SHOW YOUR HAND</div>
+      </div>
+
+      <div class="calib-center">
+        <span class="calib-word">CALIBRATION</span>
+        <span id="calibPrompt" class="calib-prompt">3</span>
+      </div>
+
+      <div class="calib-half calib-half--p2" id="calibHalfP2">
+        <div class="calib-side-name">PLAYER 2</div>
+        <div id="calibP2" class="calib-check" data-state="missing">&#10003;</div>
+        <div class="calib-side-sub">SHOW YOUR HAND</div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         PAUSE SCREEN
+         ============================================================ -->
+    <section id="pauseScreen" class="overlay screen hidden">
       <h2 class="screen-title">PAUSED</h2>
-      <button id="resumeBtn" class="neon-btn neon-btn--primary" type="button">RESUME</button>
-      <button id="openSettingsBtn" class="neon-btn neon-btn--ghost" type="button">SETTINGS</button>
+      <button id="resumeBtn" class="hx-btn" type="button">
+        <span class="hx-label">RESUME</span>
+        <span class="dwell"><i></i></span>
+      </button>
+      <button id="openSettingsBtn" class="hx-btn" type="button">
+        <span class="hx-label">SETTINGS</span>
+        <span class="dwell"><i></i></span>
+      </button>
+      <button id="quitBtn" class="hx-btn" type="button">
+        <span class="hx-label">MAIN MENU</span>
+        <span class="dwell"><i></i></span>
+      </button>
+    </section>
+
+    <!-- ============================================================
+         GAME OVER SCREEN — winner in player color
+         ============================================================ -->
+    <section id="gameOverScreen" class="overlay screen hidden">
+      <h2 id="winnerMessage" class="screen-title winner-title">PLAYER 1 WINS!</h2>
+      <p id="finalScoreLine" class="final-score">7 &mdash; 0</p>
+      <button id="playAgainBtn" class="hx-btn" type="button">
+        <span class="hx-label">REMATCH</span>
+        <span class="dwell"><i></i></span>
+      </button>
+      <button id="backToMenuBtn" class="hx-btn" type="button">
+        <span class="hx-label">MAIN MENU</span>
+        <span class="dwell"><i></i></span>
+      </button>
     </section>
 
     <!-- ============================================================
@@ -189,7 +282,10 @@
         </div>
 
         <div class="settings-actions">
-          <button id="settingsCloseBtn" class="neon-btn neon-btn--primary" type="button">CLOSE</button>
+          <button id="settingsCloseBtn" class="hx-btn hx-btn--small" type="button">
+            <span class="hx-label">CLOSE</span>
+            <span class="dwell"><i></i></span>
+          </button>
         </div>
       </div>
     </section>
