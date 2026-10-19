@@ -6,298 +6,252 @@
   <meta name="theme-color" content="#000000">
   <title>HOCKEY-AR — Webcam Hand-Tracking Battle</title>
 
-  <!-- Fonts: Orbitron (titles) + Rajdhani (UI) -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
-
   <!-- MediaPipe Hands (JavaScript, via CDN) -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
 
-  <link rel="stylesheet" href="style.css">
+  <style>
+    /* ---- base ---- */
+    :root { --cyan: #00e5ff; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      background: #000;
+      color: #f4fff9;
+      font-family: "Segoe UI", Rajdhani, Arial, sans-serif;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+    }
+    .hidden { display: none !important; }
+
+    /* ---- game surface: fills the viewport, letterboxed by JS sizing --- */
+    #gameContainer {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #gameCanvas {
+      display: block;
+      margin: auto;
+      background: #000;
+      box-shadow: 0 0 60px rgba(0, 229, 255, 0.08);
+    }
+
+    /* hidden webcam element: only ever sampled into canvases */
+    #cameraFeed { position: fixed; left: -9999px; top: 0; width: 2px; height: 2px; }
+
+    .overlay {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 18px;
+      z-index: 10;
+    }
+
+    /* ---- HUD (score pill) --- only mutated when the score changes --- */
+    #hud {
+      position: fixed;
+      top: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 12;
+      display: flex; align-items: center; gap: 14px;
+      padding: 8px 22px;
+      background: rgba(6, 10, 16, 0.72);
+      border: 1px solid rgba(0, 229, 255, 0.25);
+      border-radius: 999px;
+      backdrop-filter: blur(4px);
+      pointer-events: none;
+    }
+    .score-num {
+      font-family: Orbitron, "Segoe UI", sans-serif;
+      font-weight: 900; font-size: 26px; min-width: 34px; text-align: center;
+    }
+    .score-num--p1 { color: #39ff88; }
+    .score-num--p2 { color: #ff3b44; }
+    .score-sep { width: 1px; height: 22px; background: rgba(0,229,255,.3); }
+    .pause-btn {
+      pointer-events: auto;
+      background: none; border: none; color: #aef;
+      font-size: 16px; cursor: pointer; padding: 0 6px;
+      opacity: .85;
+    }
+    .pause-btn:hover { color: var(--cyan); }
+
+    /* ---- menu ---- */
+    #startScreen {
+      background: rgba(2, 4, 8, 0.55);
+      backdrop-filter: blur(2px);
+    }
+    .menu-logo {
+      font-family: Orbitron, sans-serif;
+      font-weight: 900; font-size: 44px; letter-spacing: 4px;
+      color: #f4fff9;
+      text-shadow: 0 0 22px rgba(0, 229, 255, 0.45);
+    }
+    .menu-logo .logo-ar { color: var(--cyan); }
+    .menu-kicker {
+      font-size: 12px; letter-spacing: 6px; color: #6de8ff;
+      text-transform: uppercase;
+    }
+    .menu-body {
+      display: flex; flex-direction: row; align-items: center;
+      gap: 46px;
+    }
+    .menu-stack { display: flex; flex-direction: column; gap: 14px; }
+
+    .hx-btn {
+      position: relative;
+      overflow: hidden;
+      font-family: "Segoe UI", sans-serif;
+      font-weight: 700; font-size: 17px; letter-spacing: 2px;
+      color: #f4fff9;
+      background: rgba(10, 16, 24, 0.85);
+      border: 1px solid rgba(0, 229, 255, 0.35);
+      border-left: 5px solid var(--cyan);
+      padding: 15px 34px;
+      cursor: pointer;
+      transform: skewX(-6deg);
+      transition: background .15s, box-shadow .15s;
+      text-align: left;
+      min-width: 240px;
+    }
+    .hx-btn > * { transform: skewX(6deg); }
+    .hx-btn:hover, .hx-btn.hot {
+      background: rgba(0, 229, 255, 0.14);
+      box-shadow: 0 0 18px rgba(0, 229, 255, 0.35);
+    }
+    .dwell {
+      position: absolute; left: 0; bottom: 0;
+      width: 100%; height: 4px;
+      background: rgba(255,255,255,0.06);
+    }
+    .dwell i {
+      display: block; width: 0%; height: 100%;
+      background: var(--cyan);
+      box-shadow: 0 0 8px var(--cyan);
+    }
+
+    /* ---- menu preview ---- */
+    .menu-visual { position: relative; width: 320px; height: 240px; }
+    #camPreview {
+      width: 100%; height: 100%;
+      border: 1px solid rgba(0, 229, 255, 0.4);
+      border-radius: 10px;
+      box-shadow: 0 0 24px rgba(0, 229, 255, 0.15);
+    }
+    .visual-tag {
+      position: absolute; bottom: 8px; right: 12px;
+      font-size: 11px; letter-spacing: 3px; color: #6de8ff;
+    }
+
+    /* hand-driven cursor */
+    #menuCursor {
+      position: fixed; left: 0; top: 0;
+      width: 26px; height: 26px;
+      margin: -13px 0 0 -13px;
+      border: 2px solid var(--cyan);
+      border-radius: 50%;
+      box-shadow: 0 0 14px rgba(0, 229, 255, 0.6);
+      z-index: 60;
+      pointer-events: none;
+      will-change: transform;
+    }
+    #menuCursor::after {
+      content: '';
+      position: absolute; left: 50%; top: 50%;
+      width: 4px; height: 4px; margin: -2px 0 0 -2px;
+      border-radius: 50%; background: var(--cyan);
+    }
+
+    /* ---- pause / game over ---- */
+    #pauseScreen, #gameOverScreen {
+      background: rgba(2, 4, 8, 0.78);
+      z-index: 30;
+    }
+    .screen-title {
+      font-family: Orbitron, sans-serif;
+      font-weight: 900; font-size: 40px;
+      letter-spacing: 6px;
+      color: #f4fff9;
+      text-shadow: 0 0 20px rgba(0, 229, 255, 0.4);
+    }
+    .final-score {
+      font-family: Orbitron, sans-serif;
+      font-weight: 700; font-size: 30px; color: #9fb4c4;
+    }
+    .winner-p1 { color: #39ff88; }
+    .winner-p2 { color: #ff3b44; }
+  </style>
 </head>
 <body>
 
-  <!-- ============================================================
-       Hidden <video> element that receives the webcam stream.
-       All drawing happens on canvases (mirrored), never directly.
-       ============================================================ -->
-  <video id="cameraFeed" playsinline autoplay muted style="display: none;"></video>
+  <!-- Hidden <video>: every drawing happens on canvases (mirrored) -->
+  <video id="cameraFeed" playsinline autoplay muted></video>
 
   <main id="gameContainer">
-
-    <!-- Game surface: camera frame + table + puck + paddles -->
     <canvas id="gameCanvas" width="1280" height="720"></canvas>
+  </main>
 
-    <!-- ============================================================
-         GAME HUD — compact centered score pill:  1  [II]  0
-         ============================================================ -->
-    <section id="gameHud" class="overlay hud-overlay hidden">
-      <div class="score-pill">
-        <span id="p1Score" class="score-num score-num--p1">0</span>
-        <span class="score-sep"></span>
-        <button id="pauseBtn" class="pause-btn" type="button" title="Pause">&#10074;&#10074;</button>
-        <span class="score-sep"></span>
-        <span id="p2Score" class="score-num score-num--p2">0</span>
-      </div>
+  <!-- HUD: score pill — DOM text written only when the score changes -->
+  <section id="hud" class="hidden" aria-hidden="true">
+    <span id="p1Score" class="score-num score-num--p1">0</span>
+    <span class="score-sep"></span>
+    <button id="pauseBtn" class="pause-btn" type="button" title="Pause">&#10074;&#10074;</button>
+    <span class="score-sep"></span>
+    <span id="p2Score" class="score-num score-num--p2">0</span>
+  </section>
 
-      <!-- FPS counter (debug mode only) -->
-      <div id="fpsDisplay" class="fps-display hidden">FPS: --</div>
-    </section>
+  <!-- MAIN MENU -->
+  <section id="startScreen" class="overlay hidden">
+    <header>
+      <div class="menu-kicker">Main Menu</div>
+      <div class="menu-logo">HOCKEY<span class="logo-ar">AR</span></div>
+    </header>
 
-    <!-- ============================================================
-         FLOATING HAND HINTS — per side when a hand is missing
-         ("SHOW YOUR HAND")
-         ============================================================ -->
-    <div id="handHintP1" class="hand-hint hand-hint--p1 hidden">
-      <div class="hand-hint-icon">&#x270B;</div>
-      <div class="hand-hint-text">P1 &mdash; SHOW<br>YOUR HAND</div>
-    </div>
-
-    <div id="handHintP2" class="hand-hint hand-hint--p2 hidden">
-      <div class="hand-hint-icon">&#x270B;</div>
-      <div class="hand-hint-text">P2 &mdash; SHOW<br>YOUR HAND</div>
-    </div>
-
-    <!-- ============================================================
-         HUD ACCURACY WARNINGS — the yellow-bar system
-         ============================================================ -->
-    <div id="handWarningP1" class="hand-warning hand-warning--p1 hidden">
-      <span class="warn-bar"></span>
-      <span id="handWarningTextP1" class="warn-text">HAND OUT OF BOUNDS</span>
-    </div>
-
-    <div id="handWarningP2" class="hand-warning hand-warning--p2 hidden">
-      <span class="warn-bar"></span>
-      <span id="handWarningTextP2" class="warn-text">HAND OUT OF BOUNDS</span>
-    </div>
-
-    <!-- GOAL splash overlay (large pop-up text on a goal, ~0.9s) -->
-    <div id="goalSplash" class="goal-splash hidden"><span class="goal-splash-text">GOAL!</span></div>
-
-    <!-- ============================================================
-         MAIN MENU — HOCKEY-AR (id kept as "startScreen").
-         Buttons are driven by: hand cursor (dwell / pinch) or mouse.
-         ============================================================ -->
-    <section id="startScreen" class="overlay screen screen--menu hidden">
-      <header class="menu-top">
-        <span class="menu-kicker">MAIN MENU</span>
-        <div class="menu-logo">HOCKEY<span class="logo-ar">AR</span></div>
-      </header>
-
+    <div class="menu-body">
       <nav class="menu-stack">
         <button id="menuPlay2p" class="hx-btn" type="button">
-          <span class="hx-label">PLAY (2 PLAYERS)</span>
+          <span>PLAY (2 PLAYERS)</span>
           <span class="dwell"><i></i></span>
         </button>
         <button id="menuSolo" class="hx-btn" type="button">
-          <span class="hx-label">SOLO VS AI</span>
-          <span class="dwell"><i></i></span>
-        </button>
-        <button id="menuHowTo" class="hx-btn" type="button">
-          <span class="hx-label">HOW TO PLAY</span>
-          <span class="dwell"><i></i></span>
-        </button>
-        <button id="menuSettings" class="hx-btn" type="button">
-          <span class="hx-label">SETTINGS</span>
+          <span>SOLO VS AI</span>
           <span class="dwell"><i></i></span>
         </button>
       </nav>
 
-      <!-- Right visual column: attract-mode canvas behind camera preview -->
+      <!-- high-visibility live camera confirmation panel -->
       <div class="menu-visual">
-        <canvas id="attractCanvas"></canvas>
         <canvas id="camPreview"></canvas>
-        <span class="visual-corner visual-corner--tl"></span>
-        <span class="visual-corner visual-corner--tr"></span>
-        <span class="visual-corner visual-corner--bl"></span>
-        <span class="visual-corner visual-corner--br"></span>
         <span class="visual-tag">CAM 01 &mdash; LIVE</span>
       </div>
+    </div>
 
-      <!-- Bottom row: player card (left), status (center), back (right) -->
-      <div class="menu-footer">
-        <!-- Placeholder user card -->
-        <div class="player-card" id="playerCard">
-          <div class="pc-icon">&#x270B;</div>
-          <div class="pc-meta">
-            <div class="pc-name">PLAYER 1</div>
-            <div class="pc-line">Matches: 0</div>
-            <div class="pc-line">Level 1</div>
-          </div>
-        </div>
+    <!-- hand-controlled cursor (index fingertip, dwell / pinch) -->
+    <div id="menuCursor" class="hidden"></div>
+  </section>
 
-        <!-- Status line: hand detection + lighting -->
-        <div class="menu-status">
-          <span class="dot" id="statusHandDot"></span>
-          <span id="statusHandText">NO HAND</span>
-          <span class="dot dot-spacer" id="statusLightDot"></span>
-          <span id="statusLightText">LIGHT: --</span>
-        </div>
+  <!-- PAUSE -->
+  <section id="pauseScreen" class="overlay hidden">
+    <h2 class="screen-title">PAUSED</h2>
+    <button id="resumeBtn" class="hx-btn" type="button"><span>RESUME</span><span class="dwell"><i></i></span></button>
+    <button id="quitBtn" class="hx-btn" type="button"><span>MAIN MENU</span><span class="dwell"><i></i></span></button>
+  </section>
 
-        <!-- Rounded back icon (inset from the corner) -->
-        <button id="menuBackBtn" class="hx-btn hx-btn--icon back-btn" type="button" title="Back">
-          <span class="hx-label">&#8592;</span>
-          <span class="dwell"><i></i></span>
-        </button>
-      </div>
-
-      <!-- Hand-controlled menu cursor -->
-      <div id="menuCursor" class="menu-cursor hidden"></div>
-    </section>
-
-    <!-- ============================================================
-         HOW TO PLAY screen
-         ============================================================ -->
-    <section id="howToScreen" class="overlay screen hidden">
-      <h2 class="screen-title">HOW TO PLAY</h2>
-
-      <ul class="howto-list">
-        <li><b>MOVE</b> &mdash; your hand is your paddle, mirrored like a real table.</li>
-        <li><b>MENU</b> &mdash; point with your index finger; hold on a button for 1s or pinch (index + thumb) to select.</li>
-        <li><b>CALIBRATION</b> &mdash; each player holds a hand over their own half until the check marks turn on.</li>
-        <li><b>STAY IN FRAME</b> &mdash; keep the whole hand away from the edges and at a comfortable distance from the camera for the best accuracy.</li>
-        <li><b>SCORE</b> &mdash; first to 7 goals wins the match.</li>
-      </ul>
-
-      <button id="howToBackBtn" class="hx-btn" type="button">
-        <span class="hx-label">&#8592; BACK</span>
-        <span class="dwell"><i></i></span>
-      </button>
-    </section>
-
-    <!-- ============================================================
-         CALIBRATION — halves split left/right, check chips confirm
-         detection while the prompt counts down 3 - 2 - 1
-         ============================================================ -->
-    <section id="calibrationScreen" class="overlay screen screen--calib hidden">
-      <div class="calib-half calib-half--p1">
-        <div class="calib-side-name">PLAYER 1</div>
-        <div id="calibP1" class="calib-check" data-state="missing">&#10003;</div>
-        <div class="calib-side-sub">SHOW YOUR HAND</div>
-      </div>
-
-      <div class="calib-center">
-        <span class="calib-word">CALIBRATION</span>
-        <span id="calibPrompt" class="calib-prompt">3</span>
-      </div>
-
-      <div class="calib-half calib-half--p2" id="calibHalfP2">
-        <div class="calib-side-name">PLAYER 2</div>
-        <div id="calibP2" class="calib-check" data-state="missing">&#10003;</div>
-        <div class="calib-side-sub">SHOW YOUR HAND</div>
-      </div>
-    </section>
-
-    <!-- ============================================================
-         PAUSE SCREEN
-         ============================================================ -->
-    <section id="pauseScreen" class="overlay screen hidden">
-      <h2 class="screen-title">PAUSED</h2>
-      <button id="resumeBtn" class="hx-btn" type="button">
-        <span class="hx-label">RESUME</span>
-        <span class="dwell"><i></i></span>
-      </button>
-      <button id="openSettingsBtn" class="hx-btn" type="button">
-        <span class="hx-label">SETTINGS</span>
-        <span class="dwell"><i></i></span>
-      </button>
-      <button id="quitBtn" class="hx-btn" type="button">
-        <span class="hx-label">MAIN MENU</span>
-        <span class="dwell"><i></i></span>
-      </button>
-    </section>
-
-    <!-- ============================================================
-         GAME OVER SCREEN — winner in player color
-         ============================================================ -->
-    <section id="gameOverScreen" class="overlay screen hidden">
-      <h2 id="winnerMessage" class="screen-title winner-title">PLAYER 1 WINS!</h2>
-      <p id="finalScoreLine" class="final-score">7 &mdash; 0</p>
-      <button id="playAgainBtn" class="hx-btn" type="button">
-        <span class="hx-label">REMATCH</span>
-        <span class="dwell"><i></i></span>
-      </button>
-      <button id="backToMenuBtn" class="hx-btn" type="button">
-        <span class="hx-label">MAIN MENU</span>
-        <span class="dwell"><i></i></span>
-      </button>
-    </section>
-
-    <!-- ============================================================
-         SETTINGS MODAL
-         ============================================================ -->
-    <section id="settingsModal" class="overlay screen-overlay hidden">
-      <div class="settings-panel">
-        <h2 class="screen-title screen-title--small">SETTINGS</h2>
-
-        <!-- Table orientation -->
-        <div class="setting-row">
-          <label class="setting-label" for="orientationSelect">Table Orientation</label>
-          <select id="orientationSelect" class="setting-input">
-            <option value="lr" selected>Left / Right</option>
-            <option value="tb">Top / Bottom</option>
-          </select>
-        </div>
-
-        <!-- Tracking smoothing -->
-        <div class="setting-row">
-          <label class="setting-label" for="smoothingRange">Smoothing Strength</label>
-          <input id="smoothingRange" class="setting-input setting-input--range" type="range"
-                 min="0" max="1" step="0.05" value="0.5">
-          <span id="smoothingValue" class="setting-value">0.5</span>
-        </div>
-
-        <!-- Puck speed / difficulty -->
-        <div class="setting-row">
-          <label class="setting-label" for="puckSpeedSelect">Puck Speed</label>
-          <select id="puckSpeedSelect" class="setting-input">
-            <option value="slow">Slow</option>
-            <option value="normal" selected>Normal</option>
-            <option value="fast">Fast</option>
-          </select>
-        </div>
-
-        <!-- Toggles -->
-        <div class="setting-row">
-          <label class="setting-label" for="cameraBgToggle">Camera Background</label>
-          <input id="cameraBgToggle" class="toggle" type="checkbox" checked>
-        </div>
-
-        <div class="setting-row">
-          <label class="setting-label" for="markersToggle">Tracking Markers</label>
-          <input id="markersToggle" class="toggle" type="checkbox" checked>
-        </div>
-
-        <div class="setting-row">
-          <label class="setting-label" for="debugToggle">Debug Mode (FPS)</label>
-          <input id="debugToggle" class="toggle" type="checkbox">
-        </div>
-
-        <!-- Sound toggle -->
-        <div class="setting-row">
-          <label class="setting-label" for="soundToggle">Sound Effects</label>
-          <input id="soundToggle" class="toggle" type="checkbox" checked>
-        </div>
-
-        <div class="settings-actions">
-          <button id="settingsCloseBtn" class="hx-btn hx-btn--small" type="button">
-            <span class="hx-label">CLOSE</span>
-            <span class="dwell"><i></i></span>
-          </button>
-        </div>
-      </div>
-    </section>
-
-  </main>
+  <!-- GAME OVER -->
+  <section id="gameOverScreen" class="overlay hidden">
+    <h2 id="winnerMessage" class="screen-title winner-p1">PLAYER 1 WINS!</h2>
+    <p id="finalScoreLine" class="final-score">0 &mdash; 0</p>
+    <button id="playAgainBtn" class="hx-btn" type="button"><span>REMATCH</span><span class="dwell"><i></i></span></button>
+    <button id="backToMenuBtn" class="hx-btn" type="button"><span>MAIN MENU</span><span class="dwell"><i></i></span></button>
+  </section>
 
   <!-- Game modules (load order matters) -->
   <script src="js/config.js"></script>
   <script src="js/audio.js"></script>
   <script src="js/tracking.js"></script>
   <script src="js/physics.js"></script>
-  <script src="js/renderer.js"></script>
   <script src="js/game.js"></script>
 </body>
 </html>

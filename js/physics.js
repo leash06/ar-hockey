@@ -1,457 +1,449 @@
 /**
  * physics.js
  * ==========================================================================
- * Fixed-timestep air hockey physics.
+ * HOCKEY-AR rebuild — zero-allocation, orientation-generic physics world.
  *
- *  - Fixed timestep: CONFIG.FIXED_DT (1/120 s) driven by an accumulator,
- *    capped at CONFIG.MAX_SUBSTEPS per frame so a slow frame can't explode.
- *  - Puck vs paddles: continuous 1D sweep (segment vs circle) inside each
- *    substep so the puck can't tunnel through a paddle, plus overlap
- *    depenetration for paddles that move into a stationary puck.
- *    Impulse = reflect puck velocity relative to paddle, then ADD the
- *    paddle velocity => fast hand swings hit harder.
- *  - Walls: bounce with CONFIG.PUCK_WALL_RESTITUTION, friction applied over
- *    time (CONFIG.PUCK_FRICTION per fixed step), hard speed cap.
- *  - Goals: opening in each end wall with post collision; a goal fires when
- *    the puck FULLY crosses the goal line.
- *  - Rounded corners: quarter-circle arcs, puck slides around them.
- *  - Anti-stuck: if the puck is slow for CONFIG.PUCK_STUCK_TIME it gets
- *    nudged toward center (corners, bad bounces, paddle pinning).
- *  - Orientation-aware: 'lr' (goals left/right) or 'tb' (goals top/bottom).
+ * Design rules
+ *  - ZERO per-frame allocation: every state vector (puck position/velocity,
+ *    paddle positions/velocities, event pool, scratch arrays) lives in
+ *    preallocated Float32Array buffers. `world.puck` / `world.pad0` /
+ *    `world.pad1` are stable typed-array VIEWS created once.
+ *  - SUB-STEPPING: each fixed step (FIXED_DT) splits puck movement into up
+ *    to PUCK_SUBSTEP_MAX equal sub-chunks (chunk length scaled from actual
+ *    travel), so a max-speed puck can never tunnel through a wall or a
+ *    paddle. Collision tests run after every sub-chunk.
+ *  - PLATFORM-AGNOSTIC: works in 'lr' (1280x720, goals left/right) and 'tb'
+ *    (720x1280, goals top/bottom) purely from orientation flags — no
+ *    duplicated code paths.
+ *  - NUDGE_HOLD: the stuck-puck auto-nudge stands down cleanly whenever a
+ *    paddle hovers within NUDGE_HOVER_PAD of the puck (player intent:
+ *    "I've got it"); when the hover clears while the puck is still stuck,
+ *    the nudge fires on the next step.
  *
- * All coordinates are in "table pixels" (CONFIG.TABLE_W/H); tracking feeds
- * normalized [0..1] targets which are converted here.
+ * Events are drained via drainEvents(fn): the pool is reused, so the game
+ * must consume events strictly between steps (the rAF loop guarantees it).
  * ==========================================================================
  */
 
-/* Module-level tuning not worth exposing in the settings UI */
-const PHYS = {
-  PUCK_PADDLE_RESTITUTION: 1.0,   // elasticity of paddle->puck reflection
-  PUCK_PADDLE_FRICTION: 0.92,     // tangential damping on paddle hits
-  PADDLE_PUSH_RATIO: 0.35,        // extra kick from paddle swing speed
-  POST_RADIUS: 10,                // goal post collision radius
-  POST_RESTITUTION: 0.7,
-  IMPACT_TO_STRENGTH: 1 / 1400,   // normalize impact speed for sfx/particles
-  WALL_TO_STRENGTH: 1 / 2000,
-};
+/* ---- state buffer offsets ---------------------------------------- */
+const E_PUCK_X = 0, E_PUCK_Y = 1, E_PUCK_VX = 2, E_PUCK_VY = 3;
+const E_PAD0_X = 4, E_PAD0_Y = 5, E_PAD1_X = 6, E_PAD1_Y = 7;   // stride 2
+
+/* ---- module constants (computed once) ---------------------------- */
+const R_PUCK = CONFIG.PUCK_RADIUS;
+const R_PADDLE = CONFIG.PADDLE_RADIUS;
+const R_CONTACT = R_PUCK + R_PADDLE;
+const SPEED2_CAP = CONFIG.PUCK_MAX_SPEED * CONFIG.PUCK_MAX_SPEED;
 
 class PhysicsWorld {
 
   constructor(orientation) {
-    // state fields first — setOrientation() resets the puck into them
-    this.puck = { x: 640, y: 360, vx: 0, vy: 0, r: CONFIG.PUCK_RADIUS };
-    this.paddles = [
-      { side: 0, x: 0.20 * CONFIG.TABLE_W, y: 0.5 * CONFIG.TABLE_H, r: CONFIG.PADDLE_RADIUS, vx: 0, vy: 0 },
-      { side: 1, x: 0.80 * CONFIG.TABLE_W, y: 0.5 * CONFIG.TABLE_H, r: CONFIG.PADDLE_RADIUS, vx: 0, vy: 0 },
-    ];
-    this.orientation = 'lr';
-    this.setOrientation(orientation);
-    this.speedMult = 1;      // set from settings (slow/normal/fast)
-    this.frozen = false;     // puck frozen during goal celebration / serve delay
-    this.acc = 0;            // fixed-timestep accumulator
-    this.stuckTimer = 0;
+    // ---- preallocated state ------------------------------------------
+    this.state = new Float32Array(8);        // puck(4) + pad0(2) + pad1(2)
+    this.padVel = new Float32Array(4);       // pad0 vx,vy | pad1 vx,vy
+    this.homes = new Float32Array(4);        // normalized home positions
+    this.clampOut = new Float32Array(2);     // half-clamp scratch
 
-    this.events = [];        // consumed by game each frame (takeEvents)
-    this.placePuckCenter();
+    // stable views — created once, never reallocated
+    this.puck = this.state.subarray(0, 4);
+    this.pad0 = this.state.subarray(4, 6);
+    this.pad1 = this.state.subarray(6, 8);
+
+    // ---- event pool (reused objects) ---------------------------------
+    this.eventPool = [];
+    for (let i = 0; i < 24; i++) {
+      this.eventPool.push({
+        type: '', x: 0, y: 0, player: -1, scorer: -1, strength: 0,
+      });
+    }
+    this.eventCount = 0;
+
+    // ---- scratch (wall flip bookkeeping) ------------------------------
+    this._flip = 0; this._fx = 0; this._fy = 0;
+    this._nearPaddle = 0;
+
+    // ---- nudge / stuck state -----------------------------------------
+    this.stuckTime = 0;
+    this.nudgeHold = false;   // true while the stuck puck is being hovered
+
+    this.frozen = false;
+    this.speedMult = 1;
+    this.margin = CONFIG.PADDLE_MARGIN;
+
+    this.setOrientation(orientation || CONFIG.DEFAULT_ORIENTATION);
   }
 
   /* ------------------------------------------------------------------ */
-  /* Setup / helpers                                                    */
+  /* Orientation                                                        */
   /* ------------------------------------------------------------------ */
 
   setOrientation(o) {
     this.orientation = o === 'tb' ? 'tb' : 'lr';
-    this.tall = this.orientation === 'tb';
-    this.W = this.tall ? CONFIG.TABLE_H : CONFIG.TABLE_W;
-    this.H = this.tall ? CONFIG.TABLE_W : CONFIG.TABLE_H;
-    this.placePuckCenter();
-    for (const p of this.paddles) { this.clampPaddle(p); p.vx = p.vy = 0; }
-  }
+    const tall = this.orientation === 'tb';
+    this.W = tall ? CONFIG.TABLE_H : CONFIG.TABLE_W;
+    this.H = tall ? CONFIG.TABLE_W : CONFIG.TABLE_H;
+    this.halfW = this.W / 2;
+    this.halfH = this.H / 2;
 
-  setSpeedMult(m) { this.speedMult = m; }
-
-  takeEvents() {
-    const out = this.events;
-    this.events = [];
-    return out;
-  }
-
-  emit(ev) { this.events.push(ev); }
-
-  maxTableSpeed() { return CONFIG.PUCK_MAX_SPEED * this.speedMult; }
-
-  placePuckCenter() {
-    this.puck.x = this.W / 2;
-    this.puck.y = this.H / 2;
-    this.puck.vx = 0; this.puck.vy = 0;
-    this.frozen = true;
-    this.stuckTimer = 0;
-  }
-
-  /**
-   * Serve the puck toward the receiving player k (0 = P1 side, 1 = P2 side).
-   * Used after goals and at game start.
-   */
-  serve(k) {
-    this.placePuckCenter();
-    this.frozen = false;
-    const speed = CONFIG.PUCK_SERVE_SPEED_BASE * this.speedMult;
-    let dir;
-    if (!this.tall) dir = { x: k === 0 ? -1 : 1, y: 0 };
-    else            dir = { x: 0, y: k === 0 ? 1 : -1 };
-    // small random angle so serves aren't 100% identical
-    const a = (Math.random() - 0.5) * 0.5;
-    const cos = Math.cos(a), sin = Math.sin(a);
-    this.puck.vx = (dir.x * cos - dir.y * sin) * speed;
-    this.puck.vy = (dir.x * sin + dir.y * cos) * speed;
-  }
-
-  /** clamp a paddle inside its own half + table bounds (never crosses center) */
-  clampPaddle(p) {
-    const r = p.r, half = !this.tall ? this.W / 2 : this.H / 2;
-    const cl = (v, a, b) => v < a ? a : (v > b ? b : v);
-    if (!this.tall) {
-      p.x = p.side === 0 ? cl(p.x, r, half - r) : cl(p.x, half + r, this.W - r);
-      p.y = cl(p.y, r, this.H - r);
+    // side 0 = P1: lr -> left half, tb -> bottom half. P2 mirrored.
+    if (tall) {
+      this.homes[0] = 0.5;  this.homes[1] = 0.8;    // P1 bottom
+      this.homes[2] = 0.5;  this.homes[3] = 0.2;    // P2 top
     } else {
-      p.x = cl(p.x, r, this.W - r);
-      p.y = p.side === 0 ? cl(p.y, half + r, this.H - r) : cl(p.y, r, half - r);
+      this.homes[0] = 0.22; this.homes[1] = 0.5;    // P1 left
+      this.homes[2] = 0.78; this.homes[3] = 0.5;    // P2 right
     }
+
+    this.frozen = false;
+    this.stuckTime = 0;
+    this.nudgeHold = false;
+    this._placePaddlesHome();
+    this.placePuckCenter();
+  }
+
+  setSpeedMult(v) { this.speedMult = v || 1; }
+
+  /* ------------------------------------------------------------------ */
+  /* Placement / serving                                                */
+  /* ------------------------------------------------------------------ */
+
+  _placePaddlesHome() {
+    const s = this.state;
+    s[E_PAD0_X] = this.homes[0] * this.W;
+    s[E_PAD0_Y] = this.homes[1] * this.H;
+    s[E_PAD1_X] = this.homes[2] * this.W;
+    s[E_PAD1_Y] = this.homes[3] * this.H;
+    this.padVel[0] = 0; this.padVel[1] = 0;
+    this.padVel[2] = 0; this.padVel[3] = 0;
+  }
+
+  /** puck to center, zero velocity, clear stuck/nudge state */
+  placePuckCenter() {
+    const s = this.state;
+    s[E_PUCK_X] = this.halfW;
+    s[E_PUCK_Y] = this.halfH;
+    s[E_PUCK_VX] = 0; s[E_PUCK_VY] = 0;
+    this.stuckTime = 0;
+    this.nudgeHold = false;
+  }
+
+  /** serve from center toward the player who conceded last */
+  serve(receiving) {
+    const ang = (Math.random() - 0.5) * 0.9;           // ±~26° cone
+    const sp = CONFIG.PUCK_SERVE_SPEED_BASE * this.speedMult;
+    const s = this.state;
+    s[E_PUCK_X] = this.halfW;
+    s[E_PUCK_Y] = this.halfH;
+    if (this.orientation === 'lr') {
+      // receiver 0 = left -> puck drifts left
+      s[E_PUCK_VX] = (receiving === 0 ? -1 : 1) * sp * Math.cos(ang);
+      s[E_PUCK_VY] = sp * Math.sin(ang);
+    } else {
+      // receiver 0 = bottom -> puck drifts down
+      s[E_PUCK_VY] = (receiving === 0 ? 1 : -1) * sp * Math.cos(ang);
+      s[E_PUCK_VX] = sp * Math.sin(ang);
+    }
+    this.frozen = false;
+    this.stuckTime = 0;
+    this.nudgeHold = false;
   }
 
   /* ------------------------------------------------------------------ */
-  /* Main update (called once per animation frame)                      */
+  /* Half-ownership clamping (orientation-generic)                      */
+  /* ------------------------------------------------------------------ */
+
+  /** clamp a paddle position to its own half; result in this.clampOut */
+  _clampToHalf(i, x, y) {
+    const m = this.margin, W = this.W, H = this.H;
+    let cx = Math.min(Math.max(x, m), W - m);
+    let cy = Math.min(Math.max(y, m), H - m);
+    if (this.orientation === 'lr') {
+      if (i === 0) cx = Math.min(cx, this.halfW - m);
+      else         cx = Math.max(cx, this.halfW + m);
+    } else {
+      if (i === 0) cy = Math.max(cy, this.halfH + m);
+      else         cy = Math.min(cy, this.halfH - m);
+    }
+    this.clampOut[0] = cx;
+    this.clampOut[1] = cy;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Events (reused pool — zero allocation)                             */
+  /* ------------------------------------------------------------------ */
+
+  _push(type) {
+    if (this.eventCount >= this.eventPool.length) return null;
+    const ev = this.eventPool[this.eventCount++];
+    ev.type = type; ev.x = 0; ev.y = 0;
+    ev.player = -1; ev.scorer = -1; ev.strength = 0;
+    return ev;
+  }
+
+  /** consume all pending events; `fn` is called once per event */
+  drainEvents(fn) {
+    const n = this.eventCount;
+    for (let i = 0; i < n; i++) fn(this.eventPool[i]);
+    this.eventCount = 0;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Paddle motion                                                      */
   /* ------------------------------------------------------------------ */
 
   /**
-   * @param {number} frameDt seconds since last frame (clamped by game loop)
-   * @param {Array|null} targets [{x,y}] normalized [0..1] paddle targets
+   * Move paddles toward the normalized targets (Float32Array(4):
+   * [p0x, p0y, p1x, p1y] from tracking/AI), capped at PADDLE_MAX_SPEED.
+   * @private
    */
-  update(frameDt, targets) {
-    if (targets) {
-      for (let i = 0; i < 2; i++) {
-        this.paddles[i].tx = targets[i].x;
-        this.paddles[i].ty = targets[i].y;
-      }
-    }
-
-    let steps = 0;
-    this.acc += frameDt;
-    while (this.acc >= CONFIG.FIXED_DT && steps < CONFIG.MAX_SUBSTEPS) {
-      this._step(CONFIG.FIXED_DT);
-      this.acc -= CONFIG.FIXED_DT;
-      steps++;
-    }
-    // too far behind — drop the backlog rather than spiral
-    if (this.acc > CONFIG.FIXED_DT * CONFIG.MAX_SUBSTEPS) this.acc = 0;
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* One fixed physics substep                                          */
-  /* ------------------------------------------------------------------ */
-
-  _step(dt) {
-    const puck = this.puck;
-
-    // 1) integrate paddles toward their targets (capped speed)
-    for (const p of this.paddles) this._integratePaddle(p, dt);
-
-    // 2) puck
-    if (!this.frozen) {
-      // continuous collision with paddles before moving
-      this._sweepPuckVsPaddles(puck, dt);
-      // move
-      puck.x += puck.vx * dt;
-      puck.y += puck.vy * dt;
-      // walls, posts, corners
-      this._collideWalls(puck, dt);
-      this._collideCorners(puck);
-      // just in case: depenetrate against paddles that moved INTO the puck
-      for (const p of this.paddles) this._resolvePaddleOverlap(puck, p);
-      // friction (per fixed step), speed cap
-      const f = Math.pow(CONFIG.PUCK_FRICTION, dt / CONFIG.FIXED_DT);
-      puck.vx *= f; puck.vy *= f;
-      this._capPuckSpeed();
-      // goal detection
-      this._checkGoal(puck);
-      // anti-stuck
-      this._checkStuck(dt);
-    }
-  }
-
-  /* -- paddle integration ------------------------------------------- */
-
-  _integratePaddle(p, dt) {
-    let tx = p.tx, ty = p.ty;
-    if (tx === undefined) { tx = p.x; ty = p.y; }
-    tx *= this.W; ty *= this.H; // normalized -> table px
-
-    const dx = tx - p.x, dy = ty - p.y;
-    const dist = Math.hypot(dx, dy);
+  _stepPaddles(dt, T) {
+    const s = this.state, pv = this.padVel;
     const maxMove = CONFIG.PADDLE_MAX_SPEED * dt;
 
-    const oldX = p.x, oldY = p.y;
-    if (dist > 1e-6) {
-      const move = Math.min(dist, maxMove);
-      p.x += dx / dist * move;
-      p.y += dy / dist * move;
-    }
-    this.clampPaddle(p);
+    for (let i = 0; i < 2; i++) {
+      const ox = s[E_PAD0_X + i * 2], oy = s[E_PAD0_Y + i * 2];
+      this._clampToHalf(i, T[i * 2] * this.W, T[i * 2 + 1] * this.H);
+      let tx = this.clampOut[0], ty = this.clampOut[1];
 
-    // actual velocity = what really happened this step (drives puck hits)
-    p.vx = (p.x - oldX) / dt;
-    p.vy = (p.y - oldY) / dt;
-  }
-
-  /* -- continuous puck sweep vs paddles ------------------------------ */
-
-  _sweepPuckVsPaddles(puck, dt) {
-    for (const pd of this.paddles) {
-      const R = puck.r + pd.r;
-      const dx = puck.vx * dt, dy = puck.vy * dt;
-      const fx = puck.x - pd.x, fy = puck.y - pd.y;
-
-      // already overlapping -> resolve directly this step
-      if (fx * fx + fy * fy < R * R) { this._resolvePaddleHit(puck, pd); continue; }
-
-      // segment |(f + t*d)| = R
-      const a = dx * dx + dy * dy;
-      if (a < 1e-9) continue;
-      const b = 2 * (fx * dx + fy * dy);
-      const c = fx * fx + fy * fy - R * R;
-      const disc = b * b - 4 * a * c;
-      if (disc < 0) continue;
-      const t = (-b - Math.sqrt(disc)) / (2 * a);
-      if (t >= 0 && t <= 1) {
-        // land exactly on the contact point, then resolve
-        puck.x += dx * t;
-        puck.y += dy * t;
-        this._resolvePaddleHit(puck, pd);
-        // push the puck along its remaining motion so it keeps sliding
-        puck.x += dx * (1 - t);
-        puck.y += dy * (1 - t);
+      const dx = tx - ox, dy = ty - oy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > maxMove) {
+        const k = maxMove / dist;
+        tx = ox + dx * k;
+        ty = oy + dy * k;
       }
+
+      s[E_PAD0_X + i * 2] = tx;
+      s[E_PAD0_Y + i * 2] = ty;
+      pv[i * 2] = (tx - ox) / dt;
+      pv[i * 2 + 1] = (ty - oy) / dt;
     }
   }
 
-  /* -- impulse resolution -------------------------------------------- */
+  /* ------------------------------------------------------------------ */
+  /* Puck integration: sub-chunks, walls, paddle collision, goals       */
+  /* ------------------------------------------------------------------ */
 
-  _resolvePaddleHit(puck, pd) {
-    let dx = puck.x - pd.x, dy = puck.y - pd.y;
-    let d = Math.hypot(dx, dy);
-    if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
-    const nx = dx / d, ny = dy / d;
-    const R = puck.r + pd.r;
-
-    // depenetrate: place puck exactly on the contact circle (tiny epsilon)
-    puck.x = pd.x + nx * (R + 0.5);
-    puck.y = pd.y + ny * (R + 0.5);
-
-    // relative velocity puck vs paddle
-    let rvx = puck.vx - pd.vx, rvy = puck.vy - pd.vy;
-    const vn = rvx * nx + rvy * ny;
-    if (vn >= 0) return; // already moving apart
-
-    // reflect relative velocity along n (+ tangential friction)
-    const e = PHYS.PUCK_PADDLE_RESTITUTION;
-    let nvn = -(1 + e) * vn;
-    const tvx = rvx - nvn * nx, tvy = rvy - nvn * ny;
-    rvx = rvx + nvn * nx - tvx * (1 - PHYS.PUCK_PADDLE_FRICTION);
-    rvy = rvy + nvn * ny - tvy * (1 - PHYS.PUCK_PADDLE_FRICTION);
-
-    puck.vx = pd.vx + rvx;
-    puck.vy = pd.vy + rvy;
-
-    // extra kick proportional to paddle swing INTO the puck
-    const push = Math.max(0, pd.vx * nx + pd.vy * ny);
-    const extra = Math.min(push * PHYS.PADDLE_PUSH_RATIO, CONFIG.PADDLE_MAX_HIT_BOOST);
-    puck.vx += nx * extra;
-    puck.vy += ny * extra;
-
-    this._capPuckSpeed();
-    this.stuckTimer = 0;
-
-    const strength = Math.max(0.15, Math.min(1, (-vn) * PHYS.IMPACT_TO_STRENGTH));
-    this.emit({
-      type: 'paddleHit', player: pd.side,
-      x: pd.x + nx * pd.r, y: pd.y + ny * pd.r, strength,
-    });
+  /** wall-flip bookkeeping for the wallHit event (contact point carrie) */
+  _markFlip(x, y) {
+    this._flip = 1;
+    this._fx = x;
+    this._fy = y;
   }
 
-  /** overlap fallback: paddle moved into a stationary puck */
-  _resolvePaddleOverlap(puck, pd) {
-    const R = puck.r + pd.r;
-    const dx = puck.x - pd.x, dy = puck.y - pd.y;
+  /**
+   * One movement sub-chunk. Returns true when a goal happened (remaining
+   * sub-chunks are then skipped — the puck is frozen).
+   * @private
+   */
+  _puckSubChunk(h) {
+    const s = this.state;
+    const r = R_PUCK, e = CONFIG.PUCK_WALL_RESTITUTION;
+    const W = this.W, H = this.H;
+    const tall = this.orientation === 'tb';
+    const mouthMin = (tall ? this.halfW : this.halfH) - CONFIG.GOAL_WIDTH / 2;
+    const mouthMax = (tall ? this.halfW : this.halfH) + CONFIG.GOAL_WIDTH / 2;
+
+    let x = s[E_PUCK_X] + s[E_PUCK_VX] * h;
+    let y = s[E_PUCK_Y] + s[E_PUCK_VY] * h;
+    let vx = s[E_PUCK_VX], vy = s[E_PUCK_VY];
+
+    if (tall) {
+      /* ---- goal axis = y (top / bottom walls) -----------------------
+         fully handled here: clamp+bounce outside the mouth, pass-through
+         inside it ------------------------------------------------------ */
+      const inMouth = x > mouthMin && x < mouthMax;
+      if (y < r) {
+        if (inMouth) { if (y < -r * 1.5) return this._goal(1); }
+        else { y = r; if (vy < 0) { vy = -vy * e; this._markFlip(x, y); } }
+      } else if (y > H - r) {
+        if (inMouth) { if (y > H + r * 1.5) return this._goal(0); }
+        else { y = H - r; if (vy > 0) { vy = -vy * e; this._markFlip(x, y); } }
+      }
+      // solid left/right walls
+      if (x < r) { x = r; if (vx < 0) { vx = -vx * e; this._markFlip(x, y); } }
+      else if (x > W - r) { x = W - r; if (vx > 0) { vx = -vx * e; this._markFlip(x, y); } }
+    } else {
+      /* ---- goal axis = x (left / right walls) ------------------------ */
+      const inMouth = y > mouthMin && y < mouthMax;
+      if (x < r) {
+        if (inMouth) { if (x < -r * 1.5) return this._goal(0); }
+        else { x = r; if (vx < 0) { vx = -vx * e; this._markFlip(x, y); } }
+      } else if (x > W - r) {
+        if (inMouth) { if (x > W + r * 1.5) return this._goal(1); }
+        else { x = W - r; if (vx > 0) { vx = -vx * e; this._markFlip(x, y); } }
+      }
+      // solid top/bottom walls
+      if (y < r) { y = r; if (vy < 0) { vy = -vy * e; this._markFlip(x, y); } }
+      else if (y > H - r) { y = H - r; if (vy > 0) { vy = -vy * e; this._markFlip(x, y); } }
+    }
+
+    s[E_PUCK_X] = x; s[E_PUCK_Y] = y;
+    s[E_PUCK_VX] = vx; s[E_PUCK_VY] = vy;
+
+    this._paddleCollide(0);
+    if (this.frozen) return true;
+    this._paddleCollide(1);
+    return this.frozen;
+  }
+
+  /** circle-circle vs paddle i: reflect relative normal velocity + boost */
+  _paddleCollide(i) {
+    const s = this.state, pv = this.padVel;
+    const px = s[E_PAD0_X + i * 2], py = s[E_PAD0_Y + i * 2];
+    const dx = s[E_PUCK_X] - px, dy = s[E_PUCK_Y] - py;
     const d2 = dx * dx + dy * dy;
-    if (d2 >= R * R) return;
-    this._resolvePaddleHit(puck, pd);
-  }
+    if (d2 >= R_CONTACT * R_CONTACT || d2 === 0) return;
 
-  /* -- walls & goal line --------------------------------------------- */
+    const d = Math.sqrt(d2);
+    const nx = dx / d, ny = dy / d;
 
-  _goalSpan() {
-    const half = CONFIG.GOAL_WIDTH / 2;
-    if (!this.tall) return { c: this.H / 2, a: this.H / 2 - half, b: this.H / 2 + half };
-    return { c: this.W / 2, a: this.W / 2 - half, b: this.W / 2 + half };
-  }
+    // relative approach speed along the contact normal
+    const puckVn = s[E_PUCK_VX] * nx + s[E_PUCK_VY] * ny;
+    const padVn = pv[i * 2] * nx + pv[i * 2 + 1] * ny;
+    const rel = puckVn - padVn;               // < 0 while approaching
 
-  _collideWalls(puck, dt) {
-    const e = CONFIG.PUCK_WALL_RESTITUTION;
-    const R = puck.r;
-    const g = this._goalSpan();
-    // is the puck horizontally/vertically inside a goal opening?
-    const inGoalMouth = !this.tall
-      ? (puck.y > g.a && puck.y < g.b)
-      : (puck.x > g.a && puck.x < g.b);
+    if (rel < 0) {
+      const strength = Math.min(1, -rel / 1600);
+      // reflect off the paddle, keep tangential component, add hit boost
+      const newVn = padVn - rel * 0.98 + CONFIG.PADDLE_MAX_HIT_BOOST * strength;
+      const tanX = s[E_PUCK_VX] - puckVn * nx;
+      const tanY = s[E_PUCK_VY] - puckVn * ny;
+      let vx = tanX + nx * newVn;
+      let vy = tanY + ny * newVn;
 
-    const bounce = (axis, wallAt, isMinSide) => {
-      if (axis === 'x') {
-        puck.x = wallAt + (isMinSide ? R : -R);
-        puck.vx = Math.abs(puck.vx) * e * (isMinSide ? 1 : -1);
-      } else {
-        puck.y = wallAt + (isMinSide ? R : -R);
-        puck.vy = Math.abs(puck.vy) * e * (isMinSide ? 1 : -1);
+      const sp2 = vx * vx + vy * vy;
+      if (sp2 > SPEED2_CAP) {
+        const k = CONFIG.PUCK_MAX_SPEED / Math.sqrt(sp2);
+        vx *= k; vy *= k;
       }
-      this.emit({
-        type: 'wallHit',
-        x: puck.x, y: puck.y,
-        strength: Math.max(0.1, Math.min(1, Math.abs(isMinSide ? puck.vx : puck.vy) * e * PHYS.WALL_TO_STRENGTH)),
-      });
-    };
+      s[E_PUCK_VX] = vx; s[E_PUCK_VY] = vy;
 
-    if (!this.tall) {
-      if (puck.x - R < 0 && !inGoalMouth) bounce('x', 0, true);
-      if (puck.x + R > this.W && !inGoalMouth) bounce('x', this.W, false);
-      if (puck.y - R < 0) bounce('y', 0, true);
-      if (puck.y + R > this.H) bounce('y', this.H, false);
-    } else {
-      if (puck.x - R < 0) bounce('x', 0, true);
-      if (puck.x + R > this.W) bounce('x', this.W, false);
-      if (puck.y - R < 0 && !inGoalMouth) bounce('y', 0, true);
-      if (puck.y + R > this.H && !inGoalMouth) bounce('y', this.H, false);
-    }
-
-    this._goalPosts(puck);
-  }
-
-  /** goal-post circles at the edges of each goal mouth */
-  _goalPosts(puck) {
-    const R = puck.r + PHYS.POST_RADIUS;
-    const g = this._goalSpan();
-    const posts = [];
-    if (!this.tall) {
-      const cy = g.c, mh = CONFIG.GOAL_WIDTH / 2;
-      posts.push([0, cy - mh], [0, cy + mh], [this.W, cy - mh], [this.W, cy + mh]);
-    } else {
-      const cx = g.c, mh = CONFIG.GOAL_WIDTH / 2;
-      posts.push([cx - mh, 0], [cx + mh, 0], [cx - mh, this.H], [cx + mh, this.H]);
-    }
-
-    for (const [px, py] of posts) {
-      const dx = puck.x - px, dy = puck.y - py;
-      const d2 = dx * dx + dy * dy;
-      if (d2 >= R * R || d2 < 1e-9) continue;
-      const d = Math.sqrt(d2);
-      const nx = dx / d, ny = dy / d;
-      puck.x = px + nx * (R + 0.5);
-      puck.y = py + ny * (R + 0.5);
-      const vn = puck.vx * nx + puck.vy * ny;
-      if (vn < 0) {
-        puck.vx -= (1 + PHYS.POST_RESTITUTION) * vn * nx;
-        puck.vy -= (1 + PHYS.POST_RESTITUTION) * vn * ny;
-        this.emit({
-          type: 'wallHit', x: puck.x, y: puck.y,
-          strength: Math.max(0.15, Math.min(1, -vn * PHYS.WALL_TO_STRENGTH)),
-        });
+      const ev = this._push('paddleHit');
+      if (ev) {
+        ev.player = i;
+        ev.x = s[E_PUCK_X]; ev.y = s[E_PUCK_Y];
+        ev.strength = strength;
       }
+
+      // a fresh hit un-sticks the puck
+      this.stuckTime = 0;
     }
+
+    // positional separation (always — prevents overlap oscillation)
+    s[E_PUCK_X] = px + nx * (R_CONTACT + 0.5);
+    s[E_PUCK_Y] = py + ny * (R_CONTACT + 0.5);
   }
 
-  /* -- rounded corner arcs ------------------------------------------- */
+  /** goal scored INTO side's goal; scorer = the other player */
+  _goal(side) {
+    this.frozen = true;
+    const s = this.state;
+    s[E_PUCK_VX] = 0; s[E_PUCK_VY] = 0;
+    this.stuckTime = 0;
+    this.nudgeHold = false;
+    const ev = this._push('goal');
+    if (ev) { ev.scorer = 1 - side; }
+    return true;
+  }
 
-  _collideCorners(puck) {
-    const cr = CONFIG.CORNER_RADIUS, R = puck.r;
-    const lim = cr - R;
-    if (lim <= 0) return;
-    const corners = [
-      [cr, cr], [this.W - cr, cr], [cr, this.H - cr], [this.W - cr, this.H - cr],
-    ];
-    for (const [cx, cy] of corners) {
-      const dx = puck.x - cx, dy = puck.y - cy;
-      const d = Math.hypot(dx, dy);
-      if (d >= lim || d < 1e-6) continue;
-      const nx = dx / d, ny = dy / d;
-      puck.x = cx + nx * lim;
-      puck.y = cy + ny * lim;
-      const vn = puck.vx * nx + puck.vy * ny;
-      if (vn < 0) {
-        const e = CONFIG.PUCK_WALL_RESTITUTION;
-        puck.vx -= (1 + e) * vn * nx;
-        puck.vy -= (1 + e) * vn * ny;
-        this.emit({
-          type: 'wallHit', x: puck.x, y: puck.y,
-          strength: Math.max(0.1, Math.min(1, -vn * PHYS.WALL_TO_STRENGTH)),
-        });
+  /* ------------------------------------------------------------------ */
+  /* Stuck-puck auto-nudge with nudgeHold stand-down                    */
+  /* ------------------------------------------------------------------ */
+
+  /** is a paddle hovering within NUDGE_HOVER_PAD of the puck? */
+  _hoverNear() {
+    const s = this.state;
+    const limit = R_CONTACT + CONFIG.NUDGE_HOVER_PAD;
+    let best = Infinity, bestI = 0;
+    for (let i = 0; i < 2; i++) {
+      const dx = s[E_PUCK_X] - s[E_PAD0_X + i * 2];
+      const dy = s[E_PUCK_Y] - s[E_PAD0_Y + i * 2];
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < best) { best = d; bestI = i; }
+    }
+    this._nearPaddle = bestI;
+    return best <= limit;
+  }
+
+  _updateStuck(dt) {
+    const s = this.state;
+    const v2 = s[E_PUCK_VX] * s[E_PUCK_VX] + s[E_PUCK_VY] * s[E_PUCK_VY];
+    const th2 = CONFIG.PUCK_STUCK_MIN_SPEED * CONFIG.PUCK_STUCK_MIN_SPEED;
+
+    if (v2 >= th2 * 4) {
+      // comfortably moving: clean full reset of the stuck machinery
+      this.stuckTime = 0;
+      this.nudgeHold = false;
+      return;
+    }
+    if (v2 < th2) this.stuckTime += dt;
+    if (this.stuckTime < CONFIG.PUCK_STUCK_TIME) return;
+
+    if (this._hoverNear()) {
+      // paddle hovering the puck: stand down cleanly and HOLD (no nudge,
+      // timers parked at the threshold until the hover clears)
+      this.nudgeHold = true;
+      this.stuckTime = CONFIG.PUCK_STUCK_TIME;
+      return;
+    }
+
+    this.nudgeHold = false;
+
+    // fire: push away from the nearer paddle (=> toward open table)
+    const ang = this._nearPaddle === 0
+      ? Math.atan2(s[E_PUCK_Y] - s[E_PAD0_Y], s[E_PUCK_X] - s[E_PAD0_X])
+      : Math.atan2(s[E_PUCK_Y] - s[E_PAD1_Y], s[E_PUCK_X] - s[E_PAD1_X]);
+    const a2 = ang + (Math.random() - 0.5) * 0.8;
+    const sp = CONFIG.PUCK_NUDGE_SPEED * this.speedMult;
+    s[E_PUCK_VX] = sp * Math.cos(a2);
+    s[E_PUCK_VY] = sp * Math.sin(a2);
+    this.stuckTime = 0;
+
+    const ev = this._push('nudge');
+    if (ev) { ev.x = s[E_PUCK_X]; ev.y = s[E_PUCK_Y]; }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Public step — call once per FIXED_DT with normalized targets       */
+  /* ------------------------------------------------------------------ */
+
+  update(dt, targets) {
+    this._stepPaddles(dt, targets);
+
+    if (this.frozen) return;
+
+    const s = this.state;
+    const speed = Math.sqrt(s[E_PUCK_VX] * s[E_PUCK_VX] + s[E_PUCK_VY] * s[E_PUCK_VY]);
+
+    // anti-tunneling: split the step's travel into up to N sub-chunks
+    const travel = speed * dt;
+    const sub = Math.min(CONFIG.PUCK_SUBSTEP_MAX,
+      Math.max(1, Math.ceil(travel / (R_PUCK * 0.9))));
+    const h = dt / sub;
+
+    this._flip = 0;
+    for (let k = 0; k < sub; k++) {
+      if (this._puckSubChunk(h)) return;   // goal (or frozen) ends the step
+    }
+
+    // wall-hit audio/fx event (at most one per fixed step)
+    if (this._flip) {
+      const sp = Math.hypot(s[E_PUCK_VX], s[E_PUCK_VY]);
+      const ev = this._push('wallHit');
+      if (ev) {
+        ev.x = this._fx; ev.y = this._fy;
+        ev.strength = Math.min(1, sp / CONFIG.PUCK_MAX_SPEED);
       }
-    }
-  }
-
-  /* -- goal detection ------------------------------------------------- */
-
-  _checkGoal(puck) {
-    const g = this._goalSpan();
-    let scorer = null; // who earns the point
-
-    if (!this.tall) {
-      const inMouthY = puck.y > g.a && puck.y < g.b;
-      if (inMouthY && puck.x + puck.r < 0) scorer = 1;        // entered P1's goal
-      if (inMouthY && puck.x - puck.r > this.W) scorer = 0;   // entered P2's goal
-    } else {
-      const inMouthX = puck.x > g.a && puck.x < g.b;
-      if (inMouthX && puck.y - puck.r > this.H) scorer = 1;   // entered P1's goal (bottom)
-      if (inMouthX && puck.y + puck.r < 0) scorer = 0;        // entered P2's goal (top)
+      this._flip = 0;
     }
 
-    if (scorer !== null) {
-      this.frozen = true;
-      this.emit({ type: 'goal', scorer, x: puck.x, y: puck.y });
-    }
-  }
+    // friction applies once per fixed step (tuning semantics independent
+    // of the number of sub-chunks taken)
+    s[E_PUCK_VX] *= CONFIG.PUCK_FRICTION;
+    s[E_PUCK_VY] *= CONFIG.PUCK_FRICTION;
 
-  /* -- anti-stuck ------------------------------------------------------ */
-
-  _checkStuck(dt) {
-    const speed = Math.hypot(this.puck.vx, this.puck.vy);
-    if (speed < CONFIG.PUCK_STUCK_MIN_SPEED) {
-      this.stuckTimer += dt;
-      if (this.stuckTimer > CONFIG.PUCK_STUCK_TIME) {
-        this.stuckTimer = 0;
-        // nudge back toward the center of the table with some randomness
-        let ax = this.W / 2 - this.puck.x, ay = this.H / 2 - this.puck.y;
-        let d = Math.hypot(ax, ay);
-        if (d < 1) { ax = 0.7; ay = 0.7; d = 1; }
-        ax /= d; ay /= d;
-        const a = (Math.random() - 0.5) * 1.1;
-        const cos = Math.cos(a), sin = Math.sin(a);
-        const s = CONFIG.PUCK_NUDGE_SPEED * this.speedMult;
-        this.puck.vx = (ax * cos - ay * sin) * s;
-        this.puck.vy = (ax * sin + ay * cos) * s;
-        this.emit({ type: 'nudge', x: this.puck.x, y: this.puck.y });
-      }
-    } else {
-      this.stuckTimer = 0;
-    }
-  }
-
-  /* -- speed cap -------------------------------------------------------- */
-
-  _capPuckSpeed() {
-    const max = this.maxTableSpeed();
-    const s = Math.hypot(this.puck.vx, this.puck.vy);
-    if (s > max && s > 0) {
-      const k = max / s;
-      this.puck.vx *= k; this.puck.vy *= k;
-    }
+    this._updateStuck(dt);
   }
 }
 

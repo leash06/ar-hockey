@@ -1,28 +1,36 @@
 /**
  * tracking.js
  * ==========================================================================
- * Hand tracking manager built on MediaPipe Hands.
+ * HOCKEY-AR rebuild — hand tracking manager built on MediaPipe Hands.
  *
  * Responsibilities
- *  - owns the <video> element + camera stream (camera_utils or fallback)
- *  - runs MediaPipe Hands on every frame
- *  - MIRRORS x coordinates so it feels like a mirror
+ *  - owns the <video> element + camera stream (camera_utils or fallback;
+ *    the fallback requests frameRate {ideal: 60, min: 30} to minimize
+ *    motion blur on fast swings)
+ *  - runs MediaPipe Hands on every camera packet
+ *  - SINGLE-POINT ANCHOR: the hand is ONE coordinate — landmark 9 (base
+ *    of the middle finger / palm center), fallback landmark 0 (wrist).
+ *    No multi-joint averaging: fingertip jitter and loop overhead gone.
+ *  - MIRRORS x coordinates so control feels like a mirror
  *  - assigns each hand to Player 1 / Player 2 by which half of the video
- *    it is in (left/right by default, top/bottom for 'tb' orientation)
- *  - smooths each hand through a One Euro Filter (velocity-adaptive,
- *    low-latency — kills jitter without adding lag on fast swings)
- *  - maps hand position into *normalized table coordinates* for the player's
- *    own half only (clamped — a hand can never cross the center line)
- *  - computes a velocity vector per player so fast swings hit harder
- *  - depth tracking: palm bounding-box size (spread of landmarks) drives
- *    "too far / too close" accuracy warnings
- *  - boundary warnings: hand too close to a video-frame edge
- *  - exposes per-player state flags: isOutOfBounds, isTooFarOrClose,
- *    palmSize, depthState
- *  - tracks "last seen" time per player so the game can (a) freeze a paddle,
- *    (b) show hints, (c) auto-pause after CONFIG.MISSING_HAND_TIMEOUT
+ *    it sits in (left/right default, top/bottom in 'tb' orientation)
+ *  - smooths every hand through a One Euro Filter with a high beta
+ *    (velocity-adaptive, zero-lag on fast strikes) and maps it into
+ *    normalized TABLE coordinates, clamped to the player's own half
+ *  - PURE 2D BOUNDS: hands are tracked as (x, y) only; anything outside
+ *    [BOUNDS_MIN..BOUNDS_MAX] is flagged isOutOfBounds. All Z-depth
+ *    ("hand too close / too far") heuristics were removed.
+ *  - SHORT-FRAME DEAD RECKONING: 1–3 dropped packets (motion blur) coast
+ *    the paddle along its last velocity vector instead of freezing.
+ *  - lostFrames streak: a packet drop counter. If no tracking packet
+ *    arrives for FILTER_DROP_RESET_FRAMES consecutive update() calls
+ *    (stalled webcam / stalled inference), every filter is FULLY reset so
+ *    stale filter state can't cause a teleport on re-entry.
+ *  - exposes per-player state: raw / target / smooth, vel, isOutOfBounds,
+ *    isLost, lastSeen — plus markers for the renderer and a hand-driven
+ *    menu cursor for the start screen.
  *
- * Normalized coordinates: x,y in [0..1] for both video and table spaces.
+ * Normalized coordinates: x, y in [0..1] for both video and table space.
  * ==========================================================================
  */
 
@@ -31,7 +39,7 @@
 /* ------------------------------------------------------------------ */
 
 class _Lowpass {
-  constructor(alpha) { this.y = null; }
+  constructor() { this.y = null; }
 
   /** @param {number} a smoothing alpha (0..1) */
   filter(x, a) {
@@ -43,22 +51,23 @@ class _Lowpass {
 
 class OneEuroFilter2D {
   /**
-   * @param {object} params shared reference {minCutoff, beta, dCutoff}
-   *        (must stay in sync with the smoothing slider -> pass the live
-   *        TrackingManager params object, not a copy)
+   * @param {object} params LIVE shared reference {minCutoff, beta, dCutoff}
+   *        (slider updates mutate this object in place — filters pick it
+   *        up without rebuilding)
    */
   constructor(params) {
     this.p = params;
+    this.x = 0; this.y = 0;
     this._resetState();
   }
 
   _resetState() {
     this.fx = new _Lowpass(); this.fy = new _Lowpass();
     this.fdx = new _Lowpass(); this.fdy = new _Lowpass();
-    this.rawX = null; this.rawY = null; // last RAW input (for velocity calc)
+    this.rawX = null; this.rawY = null;
   }
 
-  /** snap the filter to a point (after teleport-like jumps / re-acquire) */
+  /** snap the filter to a point (re-acquisition / teleport-like jumps) */
   reset(x, y) {
     this.x = x; this.y = y;
     this._resetState();
@@ -74,11 +83,9 @@ class OneEuroFilter2D {
    *          and velocity estimate (normalized units / second)
    */
   update(x, y, dt) {
-    if (!(dt > 0)) throw new Error('OneEuroFilter2D: dt must be > 0');
+    if (!(dt > 0)) dt = CONFIG.PACKET_DT_FALLBACK;
 
-    // velocity estimate from consecutive RAW positions, then low-passed
-    // (avoids the inflation you get when differentiating against the
-    // already-lagging filtered position)
+    // velocity from consecutive RAW positions, then low-passed
     if (this.rawX === null) { this.rawX = x; this.rawY = y; }
     const dx = (x - this.rawX) / dt, dy = (y - this.rawY) / dt;
     this.rawX = x; this.rawY = y;
@@ -88,7 +95,7 @@ class OneEuroFilter2D {
     const edy = this.fdy.filter(dy, aD);
     const speed = Math.hypot(edx, edy);
 
-    // adaptive cutoff: fast motion -> high cutoff -> minimal lag
+    // fast motion -> adaptive cutoff rises -> minimal lag
     const cutoff = this.p.minCutoff + this.p.beta * speed;
     const a = OneEuroFilter2D._alpha(cutoff, dt);
 
@@ -103,78 +110,86 @@ class OneEuroFilter2D {
 }
 
 /* ------------------------------------------------------------------ */
-/* TrackingManager                                                    */
+/* TrackingManager                                                     */
 /* ------------------------------------------------------------------ */
 
 const TrackingManager = (() => {
 
-  /* ------------------------------------------------------------------ */
-  /* State                                                              */
-  /* ------------------------------------------------------------------ */
+  /* ---------------------------- state ------------------------------ */
 
   let videoEl = null;
   let hands = null;            // MediaPipe Hands instance
   let cameraUtil = null;       // @mediapipe/camera_utils wrapper (optional)
-  let stream = null;           // raw MediaStream when using the fallback path
+  let stream = null;           // raw MediaStream when using the fallback
   let fallbackRafId = 0;
-  let sending = false;         // prevents overlapping MedaPipe inference calls
+  let sending = false;         // prevents overlapping MediaPipe invocations
   let running = false;
-  let onError = null;          // callback(error: Error)
 
-  let smoothing = CONFIG.DEFAULT_SMOOTHING; // 0 (raw) .. 1 (very smooth)
-  let orientation = CONFIG.DEFAULT_ORIENTATION; // 'lr' | 'tb'
-  let lastResultsTime = 0;     // perf.now of last MediaPipe callback
+  let smoothing = CONFIG.DEFAULT_SMOOTHING;
+  let orientation = CONFIG.DEFAULT_ORIENTATION;   // 'lr' | 'tb'
 
-  /* Live One Euro params — shared by every filter (slider updates apply
-     instantly to all filters without rebuilding them). */
-  const filterParams = { minCutoff: 1.8, beta: CONFIG.FILTER_BETA, dCutoff: CONFIG.FILTER_DC_CUTOFF };
+  // packet-drop protection
+  let packetId = 0;            // bumped on every MediaPipe callback
+  let lastSeenPacketId = 0;
+  let lostFrames = 0;          // consecutive updates with no fresh packet
+  let lastResultsTime = 0;
+  let onError = null;          // optional error callback
 
-  /* Markers for the renderer: raw mirrored hand points + warning flags */
+  /* LIVE One Euro params — shared by every filter. */
+  const filterParams = {
+    minCutoff: 1.8,
+    beta: CONFIG.FILTER_BETA,
+    dCutoff: CONFIG.FILTER_DC_CUTOFF,
+  };
+
+  /* Renderer markers: raw mirrored hand points + out-of-bounds flag.
+     Reused array — cleared per packet, never reallocated per-run. */
   const markers = [];
 
-  /* Menu hand-cursor state: first detected hand drives the pointer that
-     walks the main menu. Kept in mirrored normalized video coords. */
+  /* Hand-driven menu cursor (start screen), mirrored normalized coords. */
   const menuCursor = {
-    seen: false,        // was a hand detected in the last frame
-    x: 0.5, y: 0.5,     // smoothed cursor position (mirrored, normalized)
+    seen: false,
+    x: 0.5, y: 0.5,
     rawX: 0.5, rawY: 0.5,
-    pinch: false,       // index fingertip closed onto the thumb
-    palmSize: 0,        // bbox spread of the driving hand (depth proxy)
+    pinch: false,
+    palmSize: 0,
   };
-  /* Raw mirrored hands for skeleton drawing (per-hand Float32Array of 21
-     x,y pairs, preallocated — filled on each MediaPipe result). */
+
+  /* Raw mirrored hands for skeleton overlays: preallocated 21 x/y pairs. */
   const handPool = [new Float32Array(42), new Float32Array(42)];
   let handPoolCount = 0;
 
-  const players = [makePlayer(0.25, 0.5), makePlayer(0.75, 0.5)];
-
-  function makePlayer(tx, ty) {
+  function makePlayer(hx, hy) {
     const filter = new OneEuroFilter2D(filterParams);
-    filter.reset(tx, ty);
+    filter.reset(hx, hy);
     return {
+      home: { x: hx, y: hy },
       present: false,
-      lastSeen: 0,                  // perf.now when this hand was last detected
-      raw: { x: tx, y: ty },        // latest raw mirrored video coords (for continuity)
-      target: { x: tx, y: ty },     // clamped normalized table-coord target
-      smooth: { x: tx, y: ty },     // filtered position (what the paddle follows)
-      vel: { x: 0, y: 0 },          // normalized table units / second
-      isOutOfBounds: false,         // hand near/at a video-frame edge
-      isTooFarOrClose: false,       // hand outside the ideal depth range
-      isLost: false,                // no landmarks detected in this player's region
-      palmSize: 0,                  // landmark bbox spread (depth proxy)
-      depthState: null,             // 'far' | 'close' | null
+      lastSeen: 0,
+      raw: { x: hx, y: hy },    // latest raw mirrored video coords
+      target: { x: hx, y: hy }, // clamped normalized table coords target
+      smooth: { x: hx, y: hy }, // interpolated position (paddle follows)
+      vel: { x: 0, y: 0 },      // normalized velocity (units / second)
+
+      // dual-packet timestamped anchors (sub-frame interpolation):
+      // previous + current One-Euro-filtered anchor, with perf.now stamps
+      prevAnchor: { x: hx, y: hy, t: 0 },
+      targetAnchor: { x: hx, y: hy, t: 0 },
+
+      dropFrames: 0,            // consecutive packet-less updates
+      isOutOfBounds: false,     // hand outside [BOUNDS_MIN..BOUNDS_MAX]
+      isLost: false,            // no landmarks detected in this player's region
       filter,
-      oobHyst: false,               // sticky helpers (hysteresis)
-      depthHyst: null,
+      oobHyst: false,           // sticky OOB flag (hysteresis vs flicker)
     };
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Helpers                                                            */
-  /* ------------------------------------------------------------------ */
+  const players = [makePlayer(0.25, 0.5), makePlayer(0.75, 0.5)];
 
-  function tableSize(orientation) {
-    const tall = orientation === 'tb';
+  /* --------------------------- helpers ----------------------------- */
+
+  function tableSize(or) {
+    const tall = or === 'tb';
     return {
       W: tall ? CONFIG.TABLE_H : CONFIG.TABLE_W,
       H: tall ? CONFIG.TABLE_W : CONFIG.TABLE_H,
@@ -183,36 +198,20 @@ const TrackingManager = (() => {
   }
 
   /**
-   * Control point + palm size.
-   * - point: palm center (stable) or index fingertip
-   * - size : max dimension of the landmark bounding box, normalized —
-   *          a robust proxy for hand distance from the camera
+   * SINGLE-POINT ANCHOR: the hand IS one point — landmark 9 (base of the
+   * middle finger / palm center), falling back to landmark 0 (wrist).
+   * No multi-joint looping/averaging: fingertip jitter and per-frame
+   * loop overhead are eliminated at the source.
    */
   function controlPoint(lm) {
-    let sx0 = 1, sx1 = 0, sy0 = 1, sy1 = 0;
-    for (const p of lm) {
-      if (p.x < sx0) sx0 = p.x; if (p.x > sx1) sx1 = p.x;
-      if (p.y < sy0) sy0 = p.y; if (p.y > sy1) sy1 = p.y;
-    }
-    const size = Math.max(sx1 - sx0, sy1 - sy0);
-
-    let x, y;
-    if (!CONFIG.USE_PALM_CENTER) {
-      const tip = lm[CONFIG.FINGERTIP_LANDMARK] || lm[8];
-      x = tip.x; y = tip.y;
-    } else {
-      // average of wrist + the four finger-base (MCP) joints = palm center
-      const ids = [0, 5, 9, 13, 17];
-      let ax = 0, ay = 0;
-      for (const i of ids) { ax += lm[i].x; ay += lm[i].y; }
-      x = ax / ids.length; y = ay / ids.length;
-    }
-    return { x, y, size };
+    const p = lm[CONFIG.ANCHOR_LANDMARK] ||
+              lm[CONFIG.ANCHOR_FALLBACK_LANDMARK] || lm[0];
+    return p;
   }
 
   /**
    * Map a mirrored, normalized video point to normalized TABLE coords,
-   * restricted (clamped) to the player's own half.
+   * clamped to the player's own half.
    * @returns {{side:number, tx:number, ty:number}}
    */
   function mapToTable(mirX, y) {
@@ -222,16 +221,15 @@ const TrackingManager = (() => {
     const cl = (v, a, b) => v < a ? a : (v > b ? b : v);
 
     if (!tall) {
-      // Players left/right. Video x: [0..0.5] = P1 (left half of table).
+      // video x: [0..0.5] = P1 (left half of the table)
       const side = mirX < 0.5 ? 0 : 1;
       const tx = side === 0
         ? cl(mirX, mX, 0.5 - mX)
         : cl(mirX, 0.5 + mX, 1 - mX);
-      const ty = cl(y, mY, 1 - mY);
-      return { side, tx, ty };
+      return { side, tx, ty: cl(y, mY, 1 - mY) };
     }
 
-    // Players top/bottom. Video y: bottom half [0.5..1] = P1 (bottom of table).
+    // video y: bottom half [0.5..1] = P1 (bottom of the table)
     const side = y > 0.5 ? 0 : 1;
     const tx = cl(mirX, mX, 1 - mX);
     const ty = side === 0
@@ -240,71 +238,41 @@ const TrackingManager = (() => {
     return { side, tx, ty };
   }
 
-  /* ---- accuracy helpers (public, hysteresis-free versions) ---------- */
+  /* ---- pure 2D bounds (no depth heuristics) ------------------------ */
 
-  /** true if a mirrored video point is at/near a frame edge */
   function checkOutOfBounds(mirX, y) {
-    const m = CONFIG.HAND_OUT_OF_BOUNDS_MARGIN;
-    return mirX < m || mirX > 1 - m || y < m || y > 1 - m;
+    const lo = CONFIG.BOUNDS_MIN, hi = CONFIG.BOUNDS_MAX;
+    return mirX < lo || mirX > hi || y < lo || y > hi;
   }
 
-  /** 'far' | 'close' | null — depth verdict from the palm bbox size */
-  function checkDepth(palmSize) {
-    if (palmSize < CONFIG.HAND_MIN_PALM_SIZE) return 'far';
-    if (palmSize > CONFIG.HAND_MAX_PALM_SIZE) return 'close';
-    return null;
-  }
-
-  /* ---- sticky (hysteresis) warnings to prevent flicker -------------- */
-
+  /** sticky flag release so the warning doesn't flicker at the threshold */
   function updateOobFlag(p, mirX, y) {
-    const m = CONFIG.HAND_OUT_OF_BOUNDS_MARGIN;
-    const clearMargin = Math.max(0.02, m - 0.04);
+    const lo = CONFIG.BOUNDS_MIN, hi = CONFIG.BOUNDS_MAX;
+    const clearLo = lo + 0.02, clearHi = hi - 0.02;
     if (p.oobHyst) {
-      // release only once the hand is comfortably back inside
-      p.oobHyst = !(mirX > clearMargin && mirX < 1 - clearMargin &&
-                    y > clearMargin && y < 1 - clearMargin);
+      p.oobHyst = !(mirX > clearLo && mirX < clearHi &&
+                    y > clearLo && y < clearHi);
     } else {
       p.oobHyst = checkOutOfBounds(mirX, y);
     }
     p.isOutOfBounds = p.oobHyst;
   }
 
-  function updateDepthFlag(p, palmSize) {
-    const trigLo = CONFIG.HAND_MIN_PALM_SIZE;
-    const trigHi = CONFIG.HAND_MAX_PALM_SIZE;
-    // ~20% buffers so flags don't flicker at the threshold
-    const clearLo = trigLo * 1.2, clearHi = trigHi * 0.8;
-
-    if (p.depthHyst === 'far') {
-      if (palmSize >= clearLo) p.depthHyst = null;
-    } else if (p.depthHyst === 'close') {
-      if (palmSize <= clearHi) p.depthHyst = null;
-    } else {
-      p.depthHyst = checkDepth(palmSize);
-    }
-    p.depthState = p.depthHyst;
-    p.palmSize = palmSize;
-    p.isTooFarOrClose = !!p.depthHyst;
-  }
-
   /**
-   * The player's hand completely disappeared (no landmarks for this side):
-   * freeze the paddle at the last valid *safety* position, zero the velocity
-   * instantly, and flag it lost + out of bounds.
-   * Idempotent - repeats stay cheap while the hand stays gone.
+   * The player's hand disappeared completely: freeze the paddle at the
+   * last valid safe position, zero velocity, flag lost + out of bounds.
+   * Idempotent — stays cheap while the hand stays gone.
    */
   function markLost(p) {
     const wasPresent = p.present;
     p.present = false;
-    p.vel.x = 0; p.vel.y = 0;        // instant zero - no ghost momentum
+    p.vel.x = 0; p.vel.y = 0;
     p.isLost = true;
-    p.isOutOfBounds = true;          // gone off-screen is the extreme edge case
+    p.isOutOfBounds = true;
     if (wasPresent) {
-      // pull the last sampled point inward from the frame edge so the frozen
-      // paddle rests at a safe, reachable position instead of hovering at
-      // (or beyond) the boundary
-      const m = Math.max(CONFIG.HAND_OUT_OF_BOUNDS_MARGIN, 0.04);
+      // pull the sample inward from the frame edge so the frozen paddle
+      // rests somewhere reachable instead of hugging the boundary
+      const m = Math.max(CONFIG.BOUNDS_MIN + 0.01, 0.06);
       const sx = Math.min(Math.max(p.raw.x, m), 1 - m);
       const sy = Math.min(Math.max(p.raw.y, m), 1 - m);
       const t = mapToTable(sx, sy);
@@ -313,57 +281,68 @@ const TrackingManager = (() => {
     }
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Menu cursor + raw skeleton helpers                                 */
-  /* ------------------------------------------------------------------ */
+  /** full filter flush (stalled stream / drop streak exceeded) */
+  function resetAllFilters() {
+    for (const p of players) {
+      p.present = false;
+      p.isLost = true;
+      p.isOutOfBounds = true;
+      p.vel.x = 0; p.vel.y = 0;
+      p.raw.x = p.home.x; p.raw.y = p.home.y;
+      p.filter.reset(p.home.x, p.home.y);
+      // flush interpolation anchors (stale timestamps must not glide)
+      p.prevAnchor.x = p.home.x; p.prevAnchor.y = p.home.y; p.prevAnchor.t = 0;
+      p.targetAnchor.x = p.home.x; p.targetAnchor.y = p.home.y; p.targetAnchor.t = 0;
+    }
+    menuCursor.seen = false;
+    menuCursor.pinch = false;
+    handPoolCount = 0;
+  }
+
+  /* ------------------ menu cursor / skeleton pool ------------------- */
 
   /**
    * Update the menu hand-cursor from the first detected hand:
-   * - cursor = index fingertip (lm[8]) in mirrored coords, lightly lerped
-   * - pinch  = thumb tip (lm[4]) pulled close to the index tip, measured
-   *            relative to palm size (scale-invariant), with hysteresis
+   * - cursor = index fingertip in mirrored coords, lightly lerped
+   * - pinch  = index-thumb gap normalized by the wrist->middle-MCP palm
+   *            length (single vector — no multi-joint bbox loops)
    */
   function updateMenuCursor(landmarks) {
     if (!landmarks.length) {
       menuCursor.seen = false;
-      menuCursor.pinch = false;   // rising-edge consumers rely on this reset
+      menuCursor.pinch = false;
       return;
     }
     const lm = landmarks[0];
     if (!lm || lm.length < 18) { menuCursor.seen = false; menuCursor.pinch = false; return; }
 
     const tip = lm[8];
-    const rawX = 1 - tip.x;       // mirror like every other coordinate
+    const rawX = 1 - tip.x;                 // mirror x like every coordinate
     const rawY = tip.y;
 
-    // light smoothing — preciser motion is wanted here than for the paddle
     if (!menuCursor.seen) { menuCursor.rawX = rawX; menuCursor.rawY = rawY; }
     menuCursor.x += (rawX - menuCursor.x) * 0.45;
     menuCursor.y += (rawY - menuCursor.y) * 0.45;
     menuCursor.rawX = rawX; menuCursor.rawY = rawY;
 
-    // palm size (bbox spread) of the driving hand
-    let sx0 = 1, sx1 = 0, sy0 = 1, sy1 = 0;
-    for (const p of lm) {
-      if (p.x < sx0) sx0 = p.x; if (p.x > sx1) sx1 = p.x;
-      if (p.y < sy0) sy0 = p.y; if (p.y > sy1) sy1 = p.y;
-    }
-    menuCursor.palmSize = Math.max(sx1 - sx0, sy1 - sy0);
+    // palm length = wrist -> middle-finger MCP (one vector, zero loops)
+    const palmLen = Math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y);
+    menuCursor.palmSize = palmLen;
 
-    // pinch: index-thumb gap normalized by the hand's own size
+    // pinch: gap normalized by palm length, with release buffering
     const thumb = lm[4];
     const d = Math.hypot(thumb.x - tip.x, thumb.y - tip.y) /
-              Math.max(0.02, menuCursor.palmSize);
+              Math.max(0.02, palmLen);
     if (menuCursor.pinch) {
-      if (d > 0.62) menuCursor.pinch = false;   // release threshold (buffered)
-    } else if (d < 0.45) {
-      menuCursor.pinch = true;                  // engage threshold
+      if (d > 0.55) menuCursor.pinch = false;
+    } else if (d < 0.35) {
+      menuCursor.pinch = true;
     }
 
     menuCursor.seen = true;
   }
 
-  /** Fill the preallocated raw-hand pool with mirrored copies for drawing. */
+  /** fill the preallocated mirrored hand pool for skeleton drawing */
   function fillRawHands(landmarks) {
     handPoolCount = Math.min(landmarks.length, 2);
     for (let h = 0; h < handPoolCount; h++) {
@@ -371,46 +350,41 @@ const TrackingManager = (() => {
       if (!lm || lm.length < 21) { handPoolCount--; continue; }
       const dst = handPool[h];
       for (let i = 0; i < 21; i++) {
-        dst[i * 2] = 1 - lm[i].x;               // mirror x
+        dst[i * 2] = 1 - lm[i].x;          // mirror x
         dst[i * 2 + 1] = lm[i].y;
       }
     }
   }
 
-  /* ------------------------------------------------------------------ */
-  /* MediaPipe results handling                                         */
-  /* ------------------------------------------------------------------ */
+  /* ------------------- MediaPipe results handling ------------------- */
 
   function onResults(results) {
-    const now = performance.now();
-    let dt = (now - lastResultsTime) / 1000;
-    lastResultsTime = now;
-    if (!(dt > 0.005)) dt = 0.033;
+    packetId++;
+    lastResultsTime = performance.now();
+
+    let dt = (lastResultsTime - (onResults._t || lastResultsTime)) / 1000;
+    onResults._t = lastResultsTime;
+    if (!(dt > 0.005)) dt = CONFIG.PACKET_DT_FALLBACK;
     dt = Math.min(dt, 0.2);
 
     const landmarks = results.multiHandLandmarks || [];
     markers.length = 0;
 
-    // menu cursor + skeleton source (uses the raw, un-mirrored landmarks)
     updateMenuCursor(landmarks);
     fillRawHands(landmarks);
 
-    // Collect candidates {side, tx, ty, mirX, y, size}
+    // candidates: {side, tx, ty, mirX, y}
     const candidates = [];
     for (const lm of landmarks) {
       if (!lm || lm.length < 18) continue;
       const pt = controlPoint(lm);
-      const mirX = 1 - pt.x; // horizontal mirror: natural "mirror" control
+      const mirX = 1 - pt.x;
       const oob = checkOutOfBounds(mirX, pt.y);
-      const depth = checkDepth(pt.size);
-      markers.push({ x: mirX, y: pt.y, oob, depth, depthState: depth });
-      candidates.push(Object.assign(
-        { mirX, y: pt.y, size: pt.size },
-        mapToTable(mirX, pt.y),
-      ));
+      markers.push({ x: mirX, y: pt.y, oob });
+      candidates.push(Object.assign({ mirX, y: pt.y }, mapToTable(mirX, pt.y)));
     }
 
-    // Pick candidate for each player side (continuity: nearest to last raw pos)
+    // assign candidate to each player side (nearest to last raw position)
     for (let side = 0; side < 2; side++) {
       let best = null, bestD = Infinity;
       for (const c of candidates) {
@@ -423,60 +397,141 @@ const TrackingManager = (() => {
       if (best) {
         const wasAbsent = !p.present;
 
-        // teleport-like jump or fresh re-acquisition -> snap the filter
+        // teleport-like jump or fresh acquisition -> snap the filter
         const jump = Math.hypot(best.mirX - p.raw.x, best.y - p.raw.y);
         if (wasAbsent || jump > CONFIG.FILTER_JUMP_RESET_DIST) {
           p.filter.reset(best.mirX, best.y);
           p.vel.x = 0; p.vel.y = 0;
-        }        // One Euro filtered point, then mapped into the player's own half
+        }
         const f = p.filter.update(best.mirX, best.y, dt);
         const mapped = mapToTable(f.x, f.y);
 
-        // velocity in table units/s (mirX velocity matches table x direction;
-        // magnitude clamped so glitch spikes can't feed huge impulses)
-        const vx = Math.max(-8, Math.min(8, f.vx));
-        const vy = Math.max(-8, Math.min(8, f.vy));
-        p.vel.x = p.vel.x * 0.5 + vx * 0.5;
-        p.vel.y = p.vel.y * 0.5 + vy * 0.5;
+        // clamp glitch spikes so they can't feed huge impulses
+        p.vel.x = Math.max(-8, Math.min(8, f.vx));
+        p.vel.y = Math.max(-8, Math.min(8, f.vy));
 
         p.target.x = mapped.tx; p.target.y = mapped.ty;
         p.smooth.x = mapped.tx; p.smooth.y = mapped.ty;
         p.raw.x = best.mirX; p.raw.y = best.y;
 
+        // dual-packet anchor shift: current -> previous, filtered -> current
+        // (timestamps power the sub-frame interpolation in update())
+        const pa = p.prevAnchor, ta = p.targetAnchor;
+        pa.x = ta.x; pa.y = ta.y; pa.t = ta.t;
+        ta.x = f.x; ta.y = f.y; ta.t = lastResultsTime;
+        p.dropFrames = 0;
+
         updateOobFlag(p, best.mirX, best.y);
-        updateDepthFlag(p, best.size);
-        p.isLost = false;       // real landmarks again -> no longer lost
+        p.isLost = false;
         p.present = true;
-        p.lastSeen = now;
+        p.lastSeen = lastResultsTime;
       } else {
-        markLost(p);            // hand gone: freeze at safety edge, flag lost
+        markLost(p);
       }
     }
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Per-frame update (called from the main rAF loop)                   */
-  /* ------------------------------------------------------------------ */
+  /* ------------------------ per-frame update ------------------------
 
-  function update(dt) {
-    const now = performance.now();
+     Called from the main (fixed-step) engine loop (60/120 Hz), while
+     webcam packets arrive asynchronously at ~30 Hz. Two mechanisms:
 
-    // If MediaPipe stops delivering results entirely (webcam stalled),
-    // treat every player as lost.
-    if (now - lastResultsTime > 600) {
-      for (const p of players) markLost(p);
+     1. SUB-FRAME INTERPOLATION — every tick, each present paddle's
+        position is interpolated between the last two timestamped anchor
+        packets (alpha = 1 exactly at packet arrival → zero added
+        latency), with the lookahead capped at INTERP_MAX_ALPHA (1.5) so
+        a late packet never overshoots. This glides the paddle across
+        every engine tick — no visual stepping, no micro-stutter.
+
+     2. STALL FLUSH — if no packet arrives for FILTER_DROP_RESET_FRAMES
+        consecutive updates, every One Euro filter is fully reset so no
+        stale state can teleport the paddle on re-entry.
+
+     Momentum coasting (previous packet's velocity vector) takes over
+     past the lookahead cap, and past DEAD_RECKON_MAX_MS the hand is
+     marked lost. ----------------------------------------------------- */
+
+  /** shared scratch — zero allocation (pass a private `out` if reentrancy) */
+  const _interpOut = { x: 0, y: 0, alpha: 0 };
+
+  /**
+   * Interpolated anchor for a player at engine time `nowMs`.
+   * alpha = 1 + (now - tCur)/span: 1 exactly at packet arrival (zero
+   * latency), extrapolating along the prev->curr segment up to
+   * INTERP_MAX_ALPHA; past the cap, momentum-coast on p.vel until the
+   * dead-reckon window closes. Writes into `out` (default shared scratch).
+   */
+  function getInterpolatedAnchor(p, nowMs, out) {
+    const o = out || _interpOut;
+    const cur = p.targetAnchor, prv = p.prevAnchor;
+    const span = cur.t - prv.t;
+
+    // single packet so far (or clock anomaly): hold the current anchor
+    if (!(span > 0) || !(nowMs >= cur.t)) {
+      o.x = cur.x; o.y = cur.y; o.alpha = 0;
+      return o;
     }
 
-    // lost hands: velocity stays hard-zero every frame (not a decay timer),
-    // so no ghost paddle motion can ever transfer into the puck
+    const alpha = 1 + (nowMs - cur.t) / span;
+    if (alpha <= CONFIG.INTERP_MAX_ALPHA) {
+      // controlled lookahead: glide along the last camera segment
+      o.x = prv.x + (cur.x - prv.x) * alpha;
+      o.y = prv.y + (cur.y - prv.y) * alpha;
+    } else {
+      // momentum coast past the lookahead (dead reckoning)
+      const tSec = (nowMs - cur.t) / 1000;
+      o.x = cur.x + p.vel.x * tSec;
+      o.y = cur.y + p.vel.y * tSec;
+    }
+    o.alpha = alpha;
+    return o;
+  }
+
+  function update() {
+    const now = performance.now();
+
+    if (packetId !== lastSeenPacketId) {
+      // fresh packet arrived since the last update — stream is healthy
+      lastSeenPacketId = packetId;
+      lostFrames = 0;
+      for (const p of players) p.dropFrames = 0;
+    } else {
+      lostFrames++;
+    }
+
+    const sinceMs = now - lastResultsTime;
+    if (sinceMs <= CONFIG.DEAD_RECKON_MAX_MS) {
+      // sub-frame interpolation every engine tick — the paddle glides
+      // through the 30 Hz packet gaps at full 60/120 Hz refresh
+      for (const p of players) {
+        if (!p.present) continue;
+        getInterpolatedAnchor(p, now, _interpOut);
+        const mapped = mapToTable(_interpOut.x, _interpOut.y);
+        p.target.x = mapped.tx; p.target.y = mapped.ty;
+        p.smooth.x = mapped.tx; p.smooth.y = mapped.ty;
+        p.raw.x = _interpOut.x; p.raw.y = _interpOut.y;
+        p.isLost = false;
+      }
+    } else {
+      // longer than the grace window: mark lost (freeze at safe spot)
+      for (const p of players) { p.dropFrames++; markLost(p); }
+    }
+
+    if (lostFrames > CONFIG.FILTER_DROP_RESET_FRAMES) {
+      // stream stalled: flush all filter state so no teleport/float on
+      // re-entry, then wait for the next healthy packet
+      resetAllFilters();
+      lostFrames = 0;
+      lastSeenPacketId = packetId;
+    }
+
+    // lost hands: hard-zero velocity every frame (no ghost momentum)
     for (const p of players) {
       if (!p.present) { p.vel.x = 0; p.vel.y = 0; }
     }
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Camera + MediaPipe lifecycle                                       */
-  /* ------------------------------------------------------------------ */
+  /* ---------------------- camera lifecycle -------------------------- */
 
   async function start() {
     if (running) return;
@@ -499,7 +554,7 @@ const TrackingManager = (() => {
     if (typeof Camera !== 'undefined') {
       cameraUtil = new Camera(videoEl, {
         onFrame: async () => {
-          if (!sending) {
+          if (!sending && videoEl.readyState >= 2) {
             sending = true;
             try { await hands.send({ image: videoEl }); }
             finally { sending = false; }
@@ -522,13 +577,16 @@ const TrackingManager = (() => {
     running = true;
   }
 
-  /* Fallback: raw getUserMedia + rAF loop feeding hands.send() */
+  /* Fallback: raw getUserMedia + rAF loop feeding hands.send().
+     Explicitly requests a high frame rate (ideal 60, min 30) to minimize
+     motion blur on high-speed hand motions. */
   async function startFallbackCamera() {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: 'user',
         width: { ideal: CONFIG.CAMERA_WIDTH },
         height: { ideal: CONFIG.CAMERA_HEIGHT },
+        frameRate: { ideal: 60, min: 30 },
       },
       audio: false,
     });
@@ -552,25 +610,35 @@ const TrackingManager = (() => {
     if (fallbackRafId) { cancelAnimationFrame(fallbackRafId); fallbackRafId = 0; }
     if (cameraUtil) { try { cameraUtil.stop(); } catch (e) { /* noop */ } cameraUtil = null; }
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-    for (const p of players) p.present = false;
-    menuCursor.seen = false;
-    menuCursor.pinch = false;
-    handPoolCount = 0;
+    resetAllFilters();
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Public API                                                         */
-  /* ------------------------------------------------------------------ */
+  /* --------------------------- public API --------------------------- */
 
   return {
     init(video, errCb) { videoEl = video; onError = errCb; },
-    start, stop,
-    update,
+
+    start, stop, update,
 
     getPlayers: () => players,
     getMarkers: () => markers,
     getVideo: () => videoEl,
     isRunning: () => running,
+
+    /** monotonically increasing id of the last processed tracking packet
+     *  (consumers latch camera frames on fresh packets only) */
+    getPacketId: () => packetId,
+
+    /** sub-frame interpolated anchor for player i at engine time `nowMs`
+     *  (default: performance.now()) — writes {x, y, alpha} into `out`
+     *  (default: shared scratch, zero-alloc), mirrored video coords.
+     *  alpha = 1 at packet arrival, lookahead capped at INTERP_MAX_ALPHA.
+     *  update() already feeds this into players[i].smooth every tick, so
+     *  physics glides at 60/120 Hz from 30 Hz packets with no extra calls. */
+    getInterpolatedAnchor(i, nowMs, out) {
+      return getInterpolatedAnchor(players[i],
+        nowMs == null ? performance.now() : nowMs, out);
+    },
 
     /** menu hand-cursor state {seen, x, y, pinch, palmSize} */
     getMenuCursor: () => menuCursor,
@@ -578,13 +646,15 @@ const TrackingManager = (() => {
     getRawHands: () => ({ pairs: handPool, count: handPoolCount }),
 
     checkOutOfBounds,
-    checkDepth,
 
-    /** ms since player's hand was seen */
+    /** test hook: feed a synthetic MediaPipe results packet (probes) */
+    _onResults: onResults,
+
+    /** ms since player i's hand was seen */
     absentMs(i) {
       return players[i].present ? 0 : (performance.now() - players[i].lastSeen);
     },
-    /** ms since BOTH hands were seen (for auto-pause) */
+    /** ms since the required hands were seen (auto-pause source) */
     bothAbsentMs() {
       return Math.max(this.absentMs(0), this.absentMs(1));
     },
@@ -592,20 +662,28 @@ const TrackingManager = (() => {
     /** @param {number} s 0..1 — remaps the One Euro base cutoff live */
     setSmoothing(s) {
       smoothing = Math.max(0, Math.min(1, s));
-      const lo = CONFIG.FILTER_MIN_CUTOFF_MIN;   // very smooth
-      const hi = CONFIG.FILTER_MIN_CUTOFF_MAX;   // responsive
+      const lo = CONFIG.FILTER_MIN_CUTOFF_MIN;
+      const hi = CONFIG.FILTER_MIN_CUTOFF_MAX;
       filterParams.minCutoff = lo + (hi - lo) * (1 - smoothing);
       filterParams.beta = CONFIG.FILTER_BETA;
       filterParams.dCutoff = CONFIG.FILTER_DC_CUTOFF;
     },
+
     setOrientation(o) {
       orientation = o === 'tb' ? 'tb' : 'lr';
-      // the mapping changed — snap all filters to their current raw/target
+      const tall = orientation === 'tb';
+      // mapping semantics changed — snap everyone to their new home half
+      players[0].home.x = tall ? 0.5 : 0.25; players[0].home.y = tall ? 0.75 : 0.5;
+      players[1].home.x = tall ? 0.5 : 0.75; players[1].home.y = tall ? 0.25 : 0.5;
       for (const p of players) {
-        p.filter.reset(p.present ? p.raw.x : p.target.x,
-                       p.present ? p.raw.y : p.target.y);
+        p.filter.reset(p.present ? p.raw.x : p.home.x,
+                       p.present ? p.raw.y : p.home.y);
       }
     },
     getOrientation: () => orientation,
   };
 })();
+
+if (typeof window !== 'undefined') {
+  window.TrackingManager = TrackingManager;
+}
