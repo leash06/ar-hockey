@@ -20,8 +20,10 @@
  *  - PURE 2D BOUNDS: hands are tracked as (x, y) only; anything outside
  *    [BOUNDS_MIN..BOUNDS_MAX] is flagged isOutOfBounds. All Z-depth
  *    ("hand too close / too far") heuristics were removed.
- *  - SHORT-FRAME DEAD RECKONING: 1–3 dropped packets (motion blur) coast
- *    the paddle along its last velocity vector instead of freezing.
+ *  - SHORT-DROP COASTING: 1–2 consecutive packets without the hand
+ *    (motion blur, close-range misdetection) keep the paddle gliding on
+ *    its last anchor segment (dead reckoning); only a streak of
+ *    LOST_PACKET_FREEZE packets freezes the paddle in a safe spot.
  *  - lostFrames streak: a packet drop counter. If no tracking packet
  *    arrives for FILTER_DROP_RESET_FRAMES consecutive update() calls
  *    (stalled webcam / stalled inference), every filter is FULLY reset so
@@ -177,6 +179,7 @@ const TrackingManager = (() => {
       targetAnchor: { x: hx, y: hy, t: 0 },
 
       dropFrames: 0,            // consecutive packet-less updates
+      lostPackets: 0,           // consecutive results packets WITHOUT this hand
       isOutOfBounds: false,     // hand outside [BOUNDS_MIN..BOUNDS_MAX]
       isLost: false,            // no landmarks detected in this player's region
       filter,
@@ -259,9 +262,27 @@ const TrackingManager = (() => {
   }
 
   /**
-   * The player's hand disappeared completely: freeze the paddle at the
-   * last valid safe position, zero velocity, flag lost + out of bounds.
+   * A results packet arrived without this player's hand. SHORT drops
+   * (< LOST_PACKET_FREEZE packets — close-range misdetections, motion
+   * blur) keep the paddle coasting on dead reckoning so control never
+   * jerks to a stop; only a sustained streak freezes it in a safe spot.
    * Idempotent — stays cheap while the hand stays gone.
+   */
+  function handleLostPacket(p) {
+    p.lostPackets++;
+    if (p.lostPackets >= CONFIG.LOST_PACKET_FREEZE) {
+      markLost(p);
+    } else {
+      // short drop: stay present so sub-frame dead reckoning keeps the
+      // paddle gliding along its last anchor segment
+      p.present = true;
+      p.isLost = true;
+    }
+  }
+
+  /**
+   * Sustained loss: freeze the paddle at the last valid safe position,
+   * zero velocity, flag lost + out of bounds. Idempotent.
    */
   function markLost(p) {
     const wasPresent = p.present;
@@ -297,6 +318,7 @@ const TrackingManager = (() => {
     menuCursor.seen = false;
     menuCursor.pinch = false;
     handPoolCount = 0;
+    for (const p of players) p.lostPackets = 0;
   }
 
   /* ------------------ menu cursor / skeleton pool ------------------- */
@@ -420,13 +442,14 @@ const TrackingManager = (() => {
         pa.x = ta.x; pa.y = ta.y; pa.t = ta.t;
         ta.x = f.x; ta.y = f.y; ta.t = lastResultsTime;
         p.dropFrames = 0;
+        p.lostPackets = 0;
 
         updateOobFlag(p, best.mirX, best.y);
         p.isLost = false;
         p.present = true;
         p.lastSeen = lastResultsTime;
       } else {
-        markLost(p);
+        handleLostPacket(p);
       }
     }
   }

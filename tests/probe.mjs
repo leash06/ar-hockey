@@ -407,13 +407,14 @@ console.log('--- 12. short-frame dead reckoning (1-3 dropped packets) ----------
   ok(x1 > xAtLastPacket + 0.001, `dropped frame 1: paddle coasts forward (${xAtLastPacket.toFixed(3)} -> ${x1.toFixed(3)})`);
   ok(x2 > x1 + 0.001, 'dropped frame 2: momentum continues');
 
-  // past the grace window (~3 frames @30fps): freeze at a safe spot
-  clock.t = 2200; TrackingManager.update();
+  // past the grace window (~6 frames @30fps, DEAD_RECKON_MAX_MS = 200):
+  // freeze at a safe spot
+  clock.t = 2300; TrackingManager.update();
   ok(p.isLost && !p.present, 'beyond DEAD_RECKON_MAX_MS the hand is marked lost (no infinite coasting)');
   ok(p.vel.x === 0 && p.vel.y === 0, 'velocity hard-zeroed on loss (no ghost momentum)');
 
   // re-acquisition after the stall must not teleport from stale filter state
-  clock.t = 2233;
+  clock.t = 2333;
   TrackingManager._onResults({ multiHandLandmarks: [mk(0.72, 0.5)] });
   ok(p.present && Math.abs(p.raw.x - 0.28) < 1e-6, 're-acquisition snaps cleanly to the fresh anchor');
 }
@@ -439,7 +440,7 @@ console.log('--- 12b. sub-frame interpolation glide (30Hz packets @ 120Hz ticks)
   // (no multi-tick stalls = no visual stepping / micro-stutter)
   const PKT_MS = 1000 / 30, TICK_MS = 1000 / 120;
   const y = 0.5;
-  let t = 2236;                       // just after the re-acquired packet
+  let t = 2336;                       // just after the re-acquired packet
   let packetIdx = 0, stalls = 0, deepBackSteps = 0, ticks = 0;
   const startX = p.smooth.x;
   let lastX = startX;

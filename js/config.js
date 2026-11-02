@@ -84,9 +84,9 @@ const CONFIG = Object.freeze({
    * HAND TRACKING (MediaPipe Hands)
    * ====================================================================== */
   TRACK_MAX_HANDS: 2,
-  TRACK_MODEL_COMPLEXITY: 0,    // 0 = lite, 1 = full
-  TRACK_MIN_DETECTION_CONF: 0.6,
-  TRACK_MIN_TRACKING_CONF: 0.5,
+  TRACK_MODEL_COMPLEXITY: 1,    // 0 = lite, 1 = full (1 = robust at close range)
+  TRACK_MIN_DETECTION_CONF: 0.45,
+  TRACK_MIN_TRACKING_CONF: 0.4,
   /* ---- single-point anchor --------------------------------------------
    *  The hand is ONE point: MediaPipe landmark 9 (middle-finger MCP /
    *  palm center) with landmark 0 (wrist) as fallback. No multi-joint
@@ -135,7 +135,8 @@ const CONFIG = Object.freeze({
    *  lost.
    * ====================================================================== */
   INTERP_MAX_ALPHA: 1.5,        // max interpolation lookahead (alpha)
-  DEAD_RECKON_MAX_MS: 100,      // ~3 frames @30 fps packet rate
+  DEAD_RECKON_MAX_MS: 200,      // ~6 frames @30 fps — ride close-range flicker
+  LOST_PACKET_FREEZE: 3,        // packets WITHOUT the hand before the paddle freezes
 
   /* ---- flow / UI ------------------------------------------------------- */
   MISSING_HAND_TIMEOUT: 3000,   // ms without required hands -> auto-pause
